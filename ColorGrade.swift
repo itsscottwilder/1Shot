@@ -240,7 +240,8 @@ final class ColorGrade {
         comp.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
         comp.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
         comp.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
-        if forDisplay, #available(macOS 15.0, *) {
+        // `defaults write com.itsscottwilder.timecodeplayer PreviewColorTag 709` turns the sRGB tag off.
+        if forDisplay, UserDefaults.standard.string(forKey: "PreviewColorTag") != "709", #available(macOS 15.0, *) {
             comp.colorTransferFunction = AVVideoTransferFunction_IEC_sRGB   // sRGB shares 709's primaries
         }
         return comp
