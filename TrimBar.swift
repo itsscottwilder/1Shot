@@ -1257,6 +1257,11 @@ final class TrimBar: NSView {
             graphicsLive = (hit.0, g.start, g.end)
             return
         }
+        // Visual Design: any click on V1 picks that clip's design group, including clicks that land
+        // on a clip edge, trim handle, zoom marker or cut edge (those still start their drag below).
+        if stripRect.insetBy(dx: 0, dy: -8).contains(p) {
+            onPickClip?(.aroll(time(atX: p.x)))
+        }
         if let edge = sourceEdge(at: p) {
             drag = .sourceEdge(edge.0, edge.1)
             sourceEdgeDelta = 0
