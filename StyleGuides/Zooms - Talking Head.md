@@ -4,7 +4,7 @@ name: Zooms - Talking Head
 app: 1Shot
 format_version: 1
 guide_version: 2
-applies_to: one-take talking-head videos for YouTube
+applies_to: multi-take talking-head videos for YouTube
 learned_from: z0ZQMOC57g8, 1uZlLI7Iu-A, GmYFCXcf4lw, Um5KSLgUzlA (analyzed 2026-11-08)
 input: 1Shot edit transcript (.json) + the cut list for the same clip
 output: zoom list (.json)

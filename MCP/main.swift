@@ -225,7 +225,7 @@ let tool_set_sound: [String: Any] = [
 
 let tool_set_trim: [String: Any] = [
     "name": "set_trim",
-    "description": "Pipeline step 3. Sets where the real take starts and ends (seconds on the original clip), or reset: true for the whole clip. Answers with the first and last words inside the trim (when there's a transcript). Show the user the in/out with those words, then stop for approval.",
+    "description": "Pipeline step 3. Sets where the usable recording starts and ends (seconds on the original clip), or reset: true for the whole clip. Answers with the first and last words inside the trim (when there's a transcript). Show the user the in/out with those words, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "start": prop("number", "Trim in, seconds on the original clip."),
         "end": prop("number", "Trim out, seconds on the original clip."),
@@ -440,7 +440,7 @@ let tools: [[String: Any]] = [
 ]
 
 let instructions = """
-1Shot is a Mac app for preparing one-take talking-head YouTube videos. You drive it with these tools.
+1Shot is a Mac app for preparing multi-take talking-head YouTube videos. You drive it with these tools.
 
 Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after every step. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.

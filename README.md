@@ -1,13 +1,13 @@
 # 1Shot
 
-A Mac app for turning a one-take, talking-head recording into a YouTube-ready edit — and letting
+A Mac app for turning a multi-take talking-head recording into a YouTube-ready edit — and letting
 Claude do the tedious parts with you, one step at a time.
 
-You record yourself in one long take. 1Shot helps you:
+You record yourself in one go, with as many retakes as you need. 1Shot helps you:
 
 - **Look and sound right** — white balance, LUTs, levels, stabilization; voice isolation, gate,
   compressor, de-esser, limiter, and a loudness meter aimed at YouTube's −14 LUFS.
-- **Find the real take** — an on-device transcript of every word, with trim points.
+- **Find the start and end** — an on-device transcript of every word, with trim points.
 - **Tighten it** — remove ums, long pauses, false starts and retakes.
 - **Add pacing** — instant punch-in zooms on the lines that matter.
 - **Illustrate it** — stock B-roll from Pixabay (video) and Unsplash (photos), kept in a shared

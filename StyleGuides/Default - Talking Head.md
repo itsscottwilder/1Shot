@@ -4,7 +4,7 @@ name: Default - Talking Head
 app: 1Shot
 format_version: 1
 guide_version: 3
-applies_to: one-take talking-head videos (car, desk, walk-and-talk) for YouTube
+applies_to: multi-take talking-head videos (car, desk, walk-and-talk) for YouTube
 input: 1Shot edit transcript (.json)
 output: cut list (.json)
 ---
@@ -13,7 +13,7 @@ output: cut list (.json)
 
 ## Purpose
 
-Make a single-take talking-head recording feel tight and confident without sounding chopped.
+Make a multi-take talking-head recording feel tight and confident without sounding chopped.
 Remove dead air, false starts and abandoned takes. Keep the speaker's natural rhythm and any
 pause that is doing a job (emphasis, a beat before a punchline, a rhetorical list).
 
