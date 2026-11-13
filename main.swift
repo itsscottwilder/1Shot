@@ -3012,6 +3012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func openProject(_ sender: Any?) { controller?.openProjectPanel() }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if runningCopy != nil { return }   // a copy that handed off owns nothing: leave the socket alone
         controller?.saveProject()
         ControlServer.shared.stop()
     }
@@ -3100,7 +3101,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         return false
     }
 
+    // MARK: One copy at a time (3.2)
+    // Two copies of 1Shot fight over the Claude socket, the settings files and the graphics caches.
+    // So a second copy hands any files it was asked to open to the one already running, then quits.
+
+    private var runningCopy: NSRunningApplication?
+    private var handOffURLs: [URL] = []
+
+    private static func findRunningCopy() -> NSRunningApplication? {
+        guard let id = Bundle.main.bundleIdentifier else { return nil }
+        let me = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .first { $0.processIdentifier != me && !$0.isTerminated }
+    }
+
+    private func handOff(to other: NSRunningApplication) {
+        NSLog("1Shot: already running (pid \(other.processIdentifier)); handing over \(handOffURLs.count) file(s) and quitting")
+        if !handOffURLs.isEmpty {
+            // A standard "open documents" Apple event, sent straight to that process.
+            let list = NSAppleEventDescriptor.list()
+            for (i, url) in handOffURLs.enumerated() {
+                list.insert(NSAppleEventDescriptor(fileURL: url), at: i + 1)
+            }
+            let event = NSAppleEventDescriptor(eventClass: AEEventClass(kCoreEventClass),
+                                               eventID: AEEventID(kAEOpenDocuments),
+                                               targetDescriptor: NSAppleEventDescriptor(processIdentifier: other.processIdentifier),
+                                               returnID: AEReturnID(kAutoGenerateReturnID),
+                                               transactionID: AETransactionID(kAnyTransactionID))
+            event.setParam(list, forKeyword: keyDirectObject)
+            _ = try? event.sendEvent(options: [.noReply], timeout: 5)
+        }
+        other.activate()
+        NSApp.terminate(nil)
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
+        if let other = Self.findRunningCopy() { runningCopy = other; return }
         UserDefaults.standard.register(defaults: ["TimecodeVisible": true, "NormalizeLoudness": true])
         NSApp.mainMenu = buildMenu()
         Project.installStyleGuides()
@@ -3108,6 +3144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let other = runningCopy { handOff(to: other); return }
         let c = PlayerWindowController()
         controller = c
         c.window?.isReleasedWhenClosed = false   // closing hides it; the Dock icon or ⌘1 brings it back
@@ -3124,6 +3161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     // Finder "Open With", dragging onto the Dock icon, etc.
     func application(_ application: NSApplication, open urls: [URL]) {
+        if runningCopy != nil { handOffURLs += urls; return }
         guard let url = urls.first else { return }
         if let c = controller { projectSelector?.window?.orderOut(nil); c.open(url) } else { pendingURL = url }
     }

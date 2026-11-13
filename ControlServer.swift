@@ -70,7 +70,10 @@ final class ControlServer {
     }
 
     func stop() {
-        if listenFD >= 0 { close(listenFD); listenFD = -1 }
+        // Only remove the socket this copy made (never one another copy is serving).
+        guard listenFD >= 0 else { return }
+        close(listenFD)
+        listenFD = -1
         unlink(Self.socketPath)
     }
 

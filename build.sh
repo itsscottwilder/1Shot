@@ -12,6 +12,25 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+# Quit any running 1Shot first (it saves its project), so no old copy keeps running from
+# files this build is about to replace.
+BUNDLE_ID="com.itsscottwilder.timecodeplayer"
+running_copies() {
+  osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationsWithBundleIdentifier('$BUNDLE_ID').count" 2>/dev/null || echo 0
+}
+if [ "$(running_copies)" != "0" ]; then
+  echo "Quitting 1Shot..."
+  osascript -l JavaScript -e "ObjC.import('AppKit'); var a = \$.NSRunningApplication.runningApplicationsWithBundleIdentifier('$BUNDLE_ID'); for (var i = 0; i < a.count; i++) a.objectAtIndex(i).terminate; ''" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    [ "$(running_copies)" = "0" ] && break
+    sleep 0.5
+  done
+  if [ "$(running_copies)" != "0" ]; then
+    echo "1Shot is still open (maybe a dialog is waiting). Quit it, then run ./build.sh again."
+    exit 1
+  fi
+fi
+
 echo "Building..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
