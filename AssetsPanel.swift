@@ -86,7 +86,7 @@ final class AssetsPanel: NSVisualEffectView {
         // Visual Design groups: every group, its colour and how many clips are in it. Click a name to rename it.
         let groupsTitle = NSTextField(labelWithString: "Visual Design Groups")
         groupsTitle.font = .systemFont(ofSize: 12, weight: .semibold)
-        let groupsHint = NSTextField(labelWithString: "Click a name to rename. Right-click clips to regroup them.")
+        let groupsHint = NSTextField(labelWithString: "Click or right-click a name to rename. Right-click clips to regroup them.")
         groupsHint.font = .systemFont(ofSize: 10)
         groupsHint.textColor = .tertiaryLabelColor
         groupsStack.orientation = .vertical
@@ -379,6 +379,20 @@ final class AssetRow: NSTableCellView {
 }
 
 
+/// An editable text field whose right-click shows its own `menu` (e.g. Rename…). An editable
+/// field otherwise handles right-clicks itself and never shows a menu set on it.
+final class RightClickMenuField: NSTextField {
+    override func rightMouseDown(with event: NSEvent) {
+        guard currentEditor() == nil, let menu else { super.rightMouseDown(with: event); return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+}
+
+/// An image that ignores the mouse, so clicks and right-clicks go to the view behind it.
+final class PassThroughImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// A row in the Visual Design Groups list: colour dot, name (click to rename), clip count.
 final class GroupListRow: NSView, NSTextFieldDelegate {
     let groupID: String
@@ -390,10 +404,10 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
     init(id: String, name: String, color: NSColor, count: Int) {
         groupID = id
         original = name
-        field = NSTextField(string: name)
+        field = RightClickMenuField(string: name)
         super.init(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
         translatesAutoresizingMaskIntoConstraints = false
-        let dot = NSImageView(image: AssetsPanel.swatch(color, size: 11))
+        let dot = PassThroughImageView(image: AssetsPanel.swatch(color, size: 11))
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
@@ -401,7 +415,7 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
         field.lineBreakMode = .byTruncatingTail
         field.cell?.isScrollable = true
         field.delegate = self
-        field.toolTip = "Click to rename"
+        field.toolTip = "Click or right-click to rename"
         let countLabel = NSTextField(labelWithString: count == 1 ? "1 clip" : "\(count) clips")
         countLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         countLabel.textColor = .secondaryLabelColor
@@ -422,8 +436,25 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             row.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
+
+        // Right-click anywhere on the row (dot, name or count): Rename…
+        let menu = NSMenu()
+        let rename = NSMenuItem(title: "Rename…", action: #selector(startRename), keyEquivalent: "")
+        rename.target = self
+        menu.addItem(rename)
+        self.menu = menu
+        field.menu = menu
+        countLabel.menu = menu
+
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Puts the name into editing with all of it selected; Return saves, Esc puts the old name back.
+    @objc func startRename() {
+        guard let window else { return }
+        window.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
+    }
 
     func controlTextDidBeginEditing(_ obj: Notification) { isEditing = true }
 
