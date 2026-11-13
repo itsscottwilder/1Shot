@@ -1,0 +1,6 @@
+# Built by build.sh — rebuilt from source, so not saved
+*.app/
+1shot-mcp
+
+# macOS clutter
+.DS_Store
