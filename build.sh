@@ -36,17 +36,24 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"
 xcrun swiftc -O -target arm64-apple-macosx26.0 main.swift ControlServer.swift Graphics.swift Loudness.swift Undo.swift AudioRack.swift SoundDesignPanel.swift Exporter.swift TrimBar.swift VisualDesignPanel.swift TrimPanel.swift WorkspaceTabBar.swift RightPanel.swift TimelineListPanel.swift TimelinePanels.swift ExportRecipes.swift ExportPanel.swift VisualGroups.swift VisualGroupControl.swift Waveform.swift PlateHandles.swift BrollHandles.swift Assets.swift AssetsPanel.swift Project.swift Transcriber.swift Cuts.swift Zooms.swift Broll.swift DavinciExport.swift ColorGrade.swift LevelsView.swift CubeLUT.swift MeterView.swift Compressor.swift Limiter.swift Gate.swift Stabilizer.swift DeEsser.swift -o "$APP/Contents/MacOS/1Shot"
-# App icon: AppIcon.png (1024 x 1024) -> every size macOS needs -> AppIcon.icns
-if [ -f AppIcon.png ]; then
-  ICONSET="$(mktemp -d)/AppIcon.iconset"
-  mkdir -p "$ICONSET"
+# Icons: a 1024 x 1024 PNG -> every size macOS needs -> .icns
+#   AppIcon.png     -> the app's icon
+#   ProjectIcon.png -> the icon of .1shot project files (made by Tools/make-project-icon.swift)
+make_icns() {
+  local png="$1" name="$2"
+  [ -f "$png" ] || return 0
+  local iconset
+  iconset="$(mktemp -d)/$name.iconset"
+  mkdir -p "$iconset"
   for size in 16 32 128 256 512; do
-    sips -z $size $size AppIcon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-    sips -z $((size * 2)) $((size * 2)) AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    sips -z $size $size "$png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
   done
-  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-  rm -rf "$(dirname "$ICONSET")"
-fi
+  iconutil -c icns "$iconset" -o "$APP/Contents/Resources/$name.icns"
+  rm -rf "$(dirname "$iconset")"
+}
+make_icns AppIcon.png AppIcon
+make_icns ProjectIcon.png ProjectIcon
 
 # Starter editing style guides (copied to ~/Movies/1Shot/Style Guides on launch)
 if [ -d StyleGuides ]; then

@@ -33,6 +33,8 @@
             <string>com.itsscottwilder.1shot-project</string>
             <key>UTTypeDescription</key>
             <string>1Shot Project</string>
+            <key>UTTypeIconFile</key>
+            <string>ProjectIcon</string>
             <key>UTTypeConformsTo</key>
             <array>
                 <string>public.json</string>
@@ -51,6 +53,8 @@
         <dict>
             <key>CFBundleTypeName</key>
             <string>1Shot Project</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>ProjectIcon</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
             <key>LSHandlerRank</key>
