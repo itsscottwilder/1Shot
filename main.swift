@@ -96,6 +96,7 @@ final class DropView: NSView {
 // MARK: - Player window
 
 final class PlayerWindowController: NSWindowController, NSWindowDelegate {
+    fileprivate static var anyCreated = false
     private let container = DropView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
     let playerView = AVPlayerView()
     let overlay = TimecodeOverlay()
@@ -156,7 +157,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         window.minSize = NSSize(width: 520, height: 360)
         window.collectionBehavior = [.fullScreenPrimary]
         window.center()
-        window.setFrameAutosaveName("1ShotPipelineWindow")
+        // Only the first project window remembers its place; later ones cascade from the front one.
+        if !PlayerWindowController.anyCreated { window.setFrameAutosaveName("1ShotPipelineWindow") }
+        PlayerWindowController.anyCreated = true
         super.init(window: window)
         window.delegate = self
 
@@ -2652,6 +2655,33 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         player?.pause()
         saveProject()     // closing the window keeps the app running (like other Mac apps)
+        (NSApp.delegate as? AppDelegate)?.projectWindowClosed(self)
+    }
+
+    /// True when nothing is open in this window yet (no project, no clip): a new project can use it.
+    var isEmpty: Bool { project == nil && player == nil && !isExporting }
+
+    /// True when this window has the project at `url` (its .1shot file or its folder) open.
+    func isShowing(_ url: URL) -> Bool {
+        guard let project else { return false }
+        let u = url.standardizedFileURL
+        return project.fileURL.standardizedFileURL == u || project.folder.standardizedFileURL == u
+    }
+
+    /// Several projects (3.2): a closed project window that isn't the last one is let go for good.
+    /// Stops playback, audio and timers so nothing keeps running for a window that's gone.
+    func tearDown() {
+        saveProject()
+        autosaveTimer?.invalidate(); autosaveTimer = nil
+        histogramTimer?.invalidate(); histogramTimer = nil
+        if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
+        timeObserver = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        endObserver = nil
+        player?.pause()
+        rack.detach()
+        playerView.player = nil
+        player = nil
     }
 }
 
@@ -2909,14 +2939,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let selector = projectSelector ?? ProjectSelector()
         projectSelector = selector
         selector.onCreate = { [weak self] parent in
-            self?.controller?.newProject(parent: parent) { [weak self] created in
+            guard let self else { return }
+            let target = self.controllerForProject(nil)
+            target.newProject(parent: parent) { [weak self] created in
                 if created { self?.projectSelector?.window?.orderOut(nil) }
+                else { self?.discardIfUnused(target) }
             }
         }
         selector.onOpen = { [weak self] url in self?.openFromSelector(url) }
-        selector.isOpen = { [weak self] url in
-            self?.controller?.project?.fileURL.standardizedFileURL.path == url.standardizedFileURL.path
-        }
+        selector.isOpen = { [weak self] url in self?.controller(showing: url) != nil }
         selector.onBrowse = { [weak self] in
             let panel = NSOpenPanel()
             panel.title = "Open Project"
@@ -2934,14 +2965,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     private func openFromSelector(_ url: URL) {
-        guard let controller else { return }
-        controller.showWindow(nil)
-        controller.openProject(url)
-        if let project = controller.project,
-           project.fileURL.standardizedFileURL == url.standardizedFileURL || project.folder.standardizedFileURL == url.standardizedFileURL {
+        if let existing = controller(showing: url) {
             projectSelector?.window?.orderOut(nil)
-            controller.window?.makeKeyAndOrderFront(nil)
+            bringToFront(existing)
+            return
         }
+        let target = controllerForProject(url)
+        target.showWindow(nil)
+        target.openProject(url)
+        if target.isShowing(url) {
+            projectSelector?.window?.orderOut(nil)
+            bringToFront(target)
+        } else {
+            discardIfUnused(target)     // it didn't open (an alert said why)
+        }
+    }
+
+    /// A window made for a project that then wasn't created or opened: close it again,
+    /// unless it's the only one.
+    private func discardIfUnused(_ c: PlayerWindowController) {
+        guard c.isEmpty, controllers.count > 1 else { return }
+        c.close()                       // windowWillClose → projectWindowClosed lets it go
     }
 
     // File › Open Recent: rebuilt each time it's opened.
@@ -2976,10 +3020,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     @objc func openRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        controller?.open(url)
+        openRouted(url)
     }
 
-    @objc func newProject(_ sender: Any?) { controller?.newProject() }
+    /// File › New Project…: in the front window if it's empty, otherwise in a new window.
+    @objc func newProject(_ sender: Any?) {
+        let target = controllerForProject(nil)
+        target.newProject { [weak self] created in
+            if !created { self?.discardIfUnused(target) }
+        }
+    }
     @objc func saveProject(_ sender: Any?) { controller?.saveCommand() }
     @objc func saveProjectAs(_ sender: Any?) { controller?.saveAsCommand() }
     @objc func createEditTranscript(_ sender: Any?) { controller?.createEditTranscript() }
@@ -3009,11 +3059,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         GraphicsTuningStore.ensureFile()
         NSWorkspace.shared.open(Project.styleGuidesFolder)
     }
-    @objc func openProject(_ sender: Any?) { controller?.openProjectPanel() }
+    /// File › Open Project…: opens in its own window (or brings it forward if it's already open).
+    @objc func openProject(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = "Open Project"
+        panel.message = "Choose a project folder or its .1shot file."
+        if let type = UTType(filenameExtension: Project.fileExtension) {
+            panel.allowedContentTypes = [type, .folder]
+        }
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = Project.defaultLocation
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        openRouted(url)
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         if runningCopy != nil { return }   // a copy that handed off owns nothing: leave the socket alone
-        controller?.saveProject()
+        for c in controllers { c.saveProject() }
         ControlServer.shared.stop()
     }
 
@@ -3021,7 +3085,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         RecentFiles.clear()
     }
 
-    var controller: PlayerWindowController?
+    // MARK: Project windows (3.2)
+    // Each open project gets its own window. Menu commands and shortcuts go to the window in front.
+
+    private(set) var controllers: [PlayerWindowController] = []
+    private weak var lastActive: PlayerWindowController?
+
+    /// The project window in front (or the one most recently in front, while e.g. Settings is key).
+    var controller: PlayerWindowController? {
+        if let c = NSApp.keyWindow?.windowController as? PlayerWindowController { return c }
+        if let c = NSApp.mainWindow?.windowController as? PlayerWindowController { return c }
+        return lastActive ?? controllers.last
+    }
+
+    /// A new, empty project window, placed a step down and right from the one in front.
+    @discardableResult
+    func makeController() -> PlayerWindowController {
+        let c = PlayerWindowController()
+        c.window?.isReleasedWhenClosed = false
+        if let front = controller?.window, let window = c.window {
+            window.setFrame(front.frame, display: false)
+            window.setFrameTopLeftPoint(window.cascadeTopLeft(from: NSPoint(x: front.frame.minX, y: front.frame.maxY)))
+        } else if let window = c.window, let screen = window.screen ?? NSScreen.main {
+            // Fill the screen as a normal window (menu bar and Dock stay visible) — not Full Screen mode.
+            window.setFrame(screen.visibleFrame, display: false)
+        }
+        controllers.append(c)
+        return c
+    }
+
+    /// The window that already has this project open, if any.
+    func controller(showing url: URL) -> PlayerWindowController? {
+        controllers.first { $0.isShowing(url) }
+    }
+
+    /// Where a project should open: the window that already has it, the front window if it's
+    /// still empty, otherwise a new window.
+    func controllerForProject(_ url: URL?) -> PlayerWindowController {
+        if let url, let existing = controller(showing: url) { return existing }
+        if let front = controller, front.isEmpty { return front }
+        // The last window, closed (hidden) with its project saved: reuse it rather than keep it around.
+        if let closed = controllers.first(where: {
+            guard let w = $0.window else { return false }
+            return !w.isVisible && !w.isMiniaturized && !$0.isExporting
+        }) { return closed }
+        return makeController()
+    }
+
+    /// Opens a project (or a video) the way File › Open does.
+    func openRouted(_ url: URL) {
+        let isProject = url.pathExtension.lowercased() == Project.fileExtension || Self.isProjectFolder(url)
+        if isProject, let existing = controller(showing: url) {
+            bringToFront(existing)
+            return
+        }
+        // A plain video goes to the front window (which offers to add it to its project).
+        let target = isProject ? controllerForProject(url) : (controller ?? makeController())
+        projectSelector?.window?.orderOut(nil)
+        target.open(url)
+        bringToFront(target)
+    }
+
+    private static func isProjectFolder(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return false }
+        let contents = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+        return contents.contains { $0.pathExtension.lowercased() == Project.fileExtension }
+    }
+
+    func bringToFront(_ c: PlayerWindowController) {
+        c.showWindow(nil)
+        c.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// A project window was closed. The last one stays around hidden (the Dock icon brings it
+    /// back, as before); any other is let go, so its project stops using memory and audio.
+    func projectWindowClosed(_ c: PlayerWindowController) {
+        guard controllers.count > 1 else { return }
+        controllers.removeAll { $0 === c }
+        c.tearDown()
+        if lastActive === c { lastActive = nil }
+    }
+
+    /// Only the window in front plays: bringing one forward pauses the others.
+    @objc private func windowBecameMain(_ note: Notification) {
+        guard let c = (note.object as? NSWindow)?.windowController as? PlayerWindowController else { return }
+        lastActive = c
+        for other in controllers where other !== c { other.player?.pause() }
+    }
+
     private var pendingURL: URL?
     private var spaceMonitor: Any?
 
@@ -3145,25 +3298,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let other = runningCopy { handOff(to: other); return }
-        let c = PlayerWindowController()
-        controller = c
-        c.window?.isReleasedWhenClosed = false   // closing hides it; the Dock icon or ⌘1 brings it back
+        // The first project window (closing it hides it; the Dock icon or ⌘1 brings it back).
+        let c = makeController()
+        lastActive = c
+        NotificationCenter.default.addObserver(self, selector: #selector(windowBecameMain(_:)),
+                                               name: NSWindow.didBecomeMainNotification, object: nil)
         if let url = pendingURL { c.open(url); pendingURL = nil }
         else { showProjectSelector() }
         installSpaceBarMonitor()
-        ControlServer.shared.start(controller: c)   // lets Claude drive the app (MCP, version 2.4)
-        // Fill the screen as a normal window (menu bar and Dock stay visible) — not Full Screen mode.
-        if let window = c.window, let screen = window.screen ?? NSScreen.main {
-            window.setFrame(screen.visibleFrame, display: true)
-        }
+        ControlServer.shared.start()   // lets Claude drive the app (MCP, version 2.4)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     // Finder "Open With", dragging onto the Dock icon, etc.
     func application(_ application: NSApplication, open urls: [URL]) {
         if runningCopy != nil { handOffURLs += urls; return }
-        guard let url = urls.first else { return }
-        if let c = controller { projectSelector?.window?.orderOut(nil); c.open(url) } else { pendingURL = url }
+        guard !controllers.isEmpty else { pendingURL = urls.first; return }
+        for url in urls { openRouted(url) }
     }
 
     // Like other Mac apps: closing the window doesn't quit. Quit with ⌘Q.
@@ -3367,7 +3518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         window.addItem(.separator())
-        window.addItem(withTitle: "1Shot", action: #selector(showMainWindow(_:)), keyEquivalent: "1")
+        window.addItem(withTitle: "Front Project Window", action: #selector(showMainWindow(_:)), keyEquivalent: "1")
         main.addItem(submenu(window))
         NSApp.windowsMenu = window
 

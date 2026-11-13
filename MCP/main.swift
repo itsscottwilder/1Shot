@@ -10,7 +10,7 @@
 
 import Foundation
 
-let serverVersion = "2.6.0"
+let serverVersion = "2.7.0"
 let bundleID = "com.itsscottwilder.timecodeplayer"
 let supportPath = NSHomeDirectory() + "/Library/Application Support/1Shot"
 let socketPath = supportPath + "/mcp.sock"
@@ -146,7 +146,7 @@ let objectOrString: [String] = ["object", "string"]
 
 let tool_status: [String: Any] = [
     "name": "status",
-    "description": "What 1Shot has open right now: project, clip (length, fps), trim, playhead, how many cuts/zooms/B-roll, drawers, and any running job. Opens the app if it isn't running. Pass wait (up to 45 s) to wait for a running job (create_transcript, B-roll downloads) to finish.",
+    "description": "What 1Shot has open right now (in the window you work in; openProjects lists every open project): project, clip (length, fps), trim, playhead, how many cuts/zooms/B-roll, drawers, and any running job. Opens the app if it isn't running. Pass wait (up to 45 s) to wait for a running job (create_transcript, B-roll downloads) to finish.",
     "inputSchema": ["type": "object", "properties": [
         "wait": prop("number", "Seconds to wait for a running job to finish (0–45). Leave out to answer right away.")
     ]],
@@ -440,7 +440,7 @@ let tools: [[String: Any]] = [
 ]
 
 let instructions = """
-1Shot is a Mac app for preparing multi-take talking-head YouTube videos. You drive it with these tools.
+1Shot is a Mac app for preparing multi-take talking-head YouTube videos. You drive it with these tools. Several projects can be open at once, each in its own window: you work in the one your last open_project used (status shows its project and lists openProjects), so the user can switch windows without moving you.
 
 Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after every step. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.

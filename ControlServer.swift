@@ -29,12 +29,29 @@ final class ControlServer {
     }
     static var socketPath: String { supportFolder.appendingPathComponent("mcp.sock").path }
 
-    private weak var controller: PlayerWindowController?
+    /// Several projects (3.2): Claude works in the window its last open_project used, so the user
+    /// can switch to another project without Claude following. Until then (or once that window is
+    /// closed), Claude works in the window in front.
+    private weak var claudeWindow: PlayerWindowController?
+    private var controller: PlayerWindowController? {
+        let app = NSApp.delegate as? AppDelegate
+        if let w = claudeWindow, app?.controllers.contains(where: { $0 === w }) == true { return w }
+        return app?.controller
+    }
+
+    /// The window an open_project call should use: the one that already has that project, the front
+    /// window if it's empty, otherwise a new one (never replacing a project the user has open).
+    private func windowForOpen(_ args: [String: Any]) -> PlayerWindowController? {
+        guard let app = NSApp.delegate as? AppDelegate else { return controller }
+        var url: URL? = nil
+        if let s = args["path"] as? String, !s.isEmpty { url = URL(fileURLWithPath: (s as NSString).expandingTildeInPath) }
+        return app.controllerForProject(url)
+    }
+
     private var listenFD: Int32 = -1
     private let acceptQueue = DispatchQueue(label: "1Shot.mcp.accept")
 
-    func start(controller: PlayerWindowController) {
-        self.controller = controller
+    func start() {
         let folder = Self.supportFolder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         // Tells the helper where this copy of the app lives, so it can open it when it isn't running.
@@ -127,6 +144,7 @@ final class ControlServer {
         let id: Any = request["id"] ?? NSNull()
         let args = request["args"] as? [String: Any] ?? [:]
         DispatchQueue.main.async { [weak self] in
+            if command == "open_project", let w = self?.windowForOpen(args) { self?.claudeWindow = w }
             guard let controller = self?.controller else {
                 reply(Self.encode(["id": id, "ok": false, "error": "1Shot's window isn't ready yet. Try again in a moment."]))
                 return
@@ -403,7 +421,9 @@ extension PlayerWindowController {
     func mcpStatus() -> [String: Any] {
         var s: [String: Any] = [
             "app": "1Shot",
-            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
+            // Several projects (3.2): every project open in a window. Claude works in this one.
+            "openProjects": ((NSApp.delegate as? AppDelegate)?.controllers ?? []).compactMap { $0.project?.name }
         ]
         if let project {
             s["project"] = ["name": project.name, "folder": project.folder.path,
