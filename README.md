@@ -61,6 +61,13 @@ Everything runs on your Mac. Transcription is on-device (macOS downloads Apple's
 first time). The app itself only goes online for B-roll: Pixabay searches and thumbnails, and
 downloading the clips and photos you place.
 
+## Say thanks
+
+1Shot is free. If it saves you time, you can
+[buy me a coffee](https://buymeacoffee.com/itsscottwilder). It's never expected, always appreciated.
+
+<a href="https://buymeacoffee.com/itsscottwilder"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+
 ## License
 
 [MIT](LICENSE) © 2026 Scott Wilder
