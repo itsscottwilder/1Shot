@@ -113,14 +113,16 @@ final class ControlServer {
         var chunk = [UInt8](repeating: 0, count: 65_536)
         let writeLock = NSLock()
         let pending = DispatchGroup()
+        var searched = 0            // how much of `buffer` has already been searched for a line end
         while true {
             let n = read(fd, &chunk, chunk.count)
             if n < 0 && errno == EINTR { continue }
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[0..<n])
-            while let newline = buffer.firstIndex(of: 0x0A) {
+            while let newline = buffer[(buffer.startIndex + searched)...].firstIndex(of: 0x0A) {
                 let line = Data(buffer[buffer.startIndex..<newline])
                 buffer.removeSubrange(buffer.startIndex...newline)
+                searched = 0
                 guard !line.isEmpty else { continue }
                 pending.enter()
                 handle(line) { reply in
@@ -130,6 +132,7 @@ final class ControlServer {
                     pending.leave()
                 }
             }
+            searched = buffer.count
         }
         pending.wait()
         close(fd)
@@ -150,15 +153,21 @@ final class ControlServer {
                 return
             }
             controller.mcpHandle(command, args) { outcome in
-                switch outcome {
-                case .success(let value):
-                    reply(Self.encode(["id": id, "ok": true, "result": value]))
-                case .failure(let error):
-                    reply(Self.encode(["id": id, "ok": false, "error": error.localizedDescription]))
+                // Handlers answer on the main thread. Turning the answer into JSON and sending it
+                // happens off it: a frame or a preview sheet is megabytes of base64.
+                Self.replyQueue.async {
+                    switch outcome {
+                    case .success(let value):
+                        reply(Self.encode(["id": id, "ok": true, "result": value]))
+                    case .failure(let error):
+                        reply(Self.encode(["id": id, "ok": false, "error": error.localizedDescription]))
+                    }
                 }
             }
         }
     }
+
+    private static let replyQueue = DispatchQueue(label: "1Shot.control.reply", qos: .userInitiated)
 
     static func encode(_ object: [String: Any]) -> Data {
         var data: Data

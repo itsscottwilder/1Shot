@@ -169,8 +169,12 @@ final class AssetsPanel: NSVisualEffectView {
 
     /// The Visual Design groups, for the row tags and the right-click menu.
     func setGroups(_ list: [(id: String, name: String, color: NSColor)]) {
+        // This is called on every B-roll slider tick; nothing to do unless a group actually changed.
+        let same = list.count == groups.count && zip(list, groups).allSatisfy {
+            $0.id == $1.id && $0.name == $1.name && $0.color == $1.color
+        }
         groups = list
-        tableView.reloadData()
+        if !same { tableView.reloadData() }
         rebuildGroupList()
     }
 
@@ -179,10 +183,19 @@ final class AssetsPanel: NSVisualEffectView {
         guard groupsHeight != nil else { return }
         // Don't rebuild under the user's typing.
         if groupsStack.arrangedSubviews.contains(where: { ($0 as? GroupListRow)?.isEditing == true }) { return }
-        groupsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         let shown = groups.filter { $0.id != "broll" }
+        var counts: [String: Int] = [:]
+        for a in assets { counts[a.visualGroup ?? "aroll", default: 0] += 1 }
+        // Leave the rows alone when they already show exactly this (a trim drag or a slider tick
+        // calls this many times a second, and each row is a stack of views with its own menu).
+        let rows = groupsStack.arrangedSubviews.compactMap { $0 as? GroupListRow }
+        if rows.count == groupsStack.arrangedSubviews.count, rows.count == shown.count,
+           zip(rows, shown).allSatisfy({ $0.shows(id: $1.id, name: $1.name, color: $1.color, count: counts[$1.id] ?? 0) }) {
+            return
+        }
+        groupsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for g in shown {
-            let count = assets.filter { ($0.visualGroup ?? "aroll") == g.id }.count
+            let count = counts[g.id] ?? 0
             let row = GroupListRow(id: g.id, name: g.name, color: g.color, count: count)
             row.onRename = { [weak self] id, name in self?.onRenameGroup?(id, name) }
             groupsStack.addArrangedSubview(row)
@@ -400,10 +413,19 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
     private let field: NSTextField
     private var original: String
     private(set) var isEditing = false
+    private let color: NSColor
+    private let count: Int
+
+    /// True when this row already shows exactly this group (so it needn't be rebuilt).
+    func shows(id: String, name: String, color: NSColor, count: Int) -> Bool {
+        groupID == id && field.stringValue == name && self.color == color && self.count == count
+    }
 
     init(id: String, name: String, color: NSColor, count: Int) {
         groupID = id
         original = name
+        self.color = color
+        self.count = count
         field = RightClickMenuField(string: name)
         super.init(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
         translatesAutoresizingMaskIntoConstraints = false

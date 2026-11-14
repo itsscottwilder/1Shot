@@ -85,7 +85,8 @@ final class ColorGrade {
     /// The look for the A-roll clip playing at clip time `t`.
     private func arollGrade(at t: Double) -> (Settings, CubeLUT?, CubeLUT?) {
         lock.lock()
-        let idx = _arollBoundaries.filter { t >= $0 }.count
+        var idx = 0
+        for boundary in _arollBoundaries where t >= boundary { idx += 1 }     // every frame: no array made
         let gid = idx < _arollGroups.count ? _arollGroups[idx] : VisualGroup.arollID
         let g = _groupGrades[gid]
         let base = (_settings, _lut, _creativeLUT)

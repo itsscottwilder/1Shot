@@ -88,10 +88,10 @@ extension PlayerWindowController {
 
     private func cachedLUT(_ name: String?) -> CubeLUT? {
         guard let name else { return nil }
-        if let hit = visualLUTCache[name] { return hit }
-        guard let url = lutURL(named: name), let lut = try? CubeLUT(url: url) else { return nil }
-        visualLUTCache[name] = lut
-        return lut
+        // Normally it's in the library and already loaded: one file check, no folder listing.
+        if let lut = try? CubeLUT.cached(url: CubeLUT.libraryFolder.appendingPathComponent(name)) { return lut }
+        guard let url = lutURL(named: name) else { return nil }      // only the project has it: bring it over
+        return try? CubeLUT.cached(url: url)
     }
 
     func lutURL(named name: String) -> URL? {

@@ -417,6 +417,11 @@ extension PlayerWindowController {
                                    color: TrimBar.graphicsColor, thumbnail: graphicsThumb(p))
         }
         graphicsPanel.setRows(rows, summary: "\(graphics.count) plate\(graphics.count == 1 ? "" : "s")")
+        // Forget the thumbnails of plates that are gone.
+        if plateThumbCache.count > graphics.count {
+            let ids = Set(graphics.map(\.id))
+            plateThumbCache = plateThumbCache.filter { ids.contains($0.key) }
+        }
     }
 
     // MARK: Thumbnails
@@ -427,17 +432,31 @@ extension PlayerWindowController {
         guard let url = brollURL(c) else { return }
         let key = brollThumbKey(c)
         if c.isPhoto {
-            if let img = NSImage(contentsOf: url) { listThumbCache[key] = img; brollPanel.setThumbnail(img, row: row) }
+            // A small copy is all the list needs (a full-size photo can be tens of MB once decoded).
+            let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                            kCGImageSourceCreateThumbnailWithTransform: true,
+                                            kCGImageSourceThumbnailMaxPixelSize: 384]
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                listThumbCache[key] = img
+                brollPanel.setThumbnail(img, row: row)
+            }
             return
         }
+        // One request per thumbnail: the list is refreshed on every slider tick, and each
+        // AVAssetImageGenerator opens its own video decoders.
+        guard !brollThumbsLoading.contains(key) else { return }
+        brollThumbsLoading.insert(key)
         let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 192, height: 108)
         let t = CMTime(seconds: (c.sourceIn ?? 0) + 0.5, preferredTimescale: 600)
         gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: t)]) { [weak self] _, cg, _, _, _ in
-            guard let cg else { return }
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.brollThumbsLoading.remove(key)
+                guard let cg else { return }
                 let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 self.listThumbCache[key] = img
                 if let r = self.broll.firstIndex(where: { self.brollThumbKey($0) == key }) { self.brollPanel.setThumbnail(img, row: r) }
@@ -445,10 +464,11 @@ extension PlayerWindowController {
         }
     }
 
-    /// The plate itself, drawn small on a dark frame (cached by its content).
+    /// The plate itself, drawn small on a dark frame. Kept per plate and redrawn only when the
+    /// plate or the graphics style changes.
     private func graphicsThumb(_ p: GraphicPlate) -> NSImage? {
-        let key = "plate:" + ((try? JSONEncoder().encode(p)).map { String(decoding: $0, as: UTF8.self) } ?? p.id)
-        if let hit = listThumbCache[key] { return hit }
+        let style = "\(GraphicsStyle.redHex)|\(GraphicsTuningStore.version)"
+        if let hit = plateThumbCache[p.id], hit.plate == p, hit.style == style { return hit.image }
         let w = 192, h = 108
         guard let plate = PlateDrawing.render(p, width: w, height: h, red: GraphicsStyle.red) else { return nil }
         let img = NSImage(size: NSSize(width: w, height: h))
@@ -457,7 +477,7 @@ extension PlayerWindowController {
         NSRect(x: 0, y: 0, width: w, height: h).fill()
         NSGraphicsContext.current?.cgContext.draw(plate, in: CGRect(x: 0, y: 0, width: w, height: h))
         img.unlockFocus()
-        listThumbCache[key] = img
+        plateThumbCache[p.id] = (plate: p, style: style, image: img)
         return img
     }
 }

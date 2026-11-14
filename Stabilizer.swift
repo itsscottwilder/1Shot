@@ -5,6 +5,7 @@
 import Foundation
 import AVFoundation
 import CoreImage
+import Accelerate
 
 final class Stabilizer {
     enum StabilizeError: LocalizedError {
@@ -162,7 +163,9 @@ final class Stabilizer {
             var measured = 0, skipped = 0
             var travel = 0.0
 
-            while let sample = output.copyNextSampleBuffer() {
+            // One pool per frame: this loop runs for the whole clip inside a single block, so
+            // anything autoreleased along the way would otherwise pile up until it ends.
+            while let sample = autoreleasepool(invoking: { output.copyNextSampleBuffer() }) {
                 if isCancelled { reader.cancelReading(); return .failure(StabilizeError.cancelled) }
                 guard let pixels = CMSampleBufferGetImageBuffer(sample),
                       let gray = Self.grayscale(pixels, width: w, height: h) else { continue }
@@ -370,7 +373,8 @@ final class Stabilizer {
         let radius = min(n, max(1, Int((3 * sigma).rounded(.up))))
         let weights = (0...radius).map { exp(-Double($0 * $0) / (2 * sigma * sigma)) }
         var out = [Double](repeating: 0, count: n)
-        for i in 0..<n {
+        // Near the two ends the window is cut short, so the weights are re-totalled for each frame.
+        func edge(_ i: Int) {
             var sum = 0.0, total = 0.0
             let lo = max(0, i - radius), hi = min(n - 1, i + radius)
             for j in lo...hi {
@@ -379,6 +383,27 @@ final class Stabilizer {
                 total += w
             }
             out[i] = sum / total
+        }
+        let interior = n - 2 * radius       // frames with the whole window inside the clip
+        guard interior > 0 else {
+            for i in 0..<n { edge(i) }
+            return out
+        }
+        for i in 0..<radius { edge(i) }
+        for i in (n - radius)..<n { edge(i) }
+        // Everything in between uses the same full window: one vectorized pass (Accelerate) instead
+        // of frames × window multiplications in a plain loop. This runs on every slider tick.
+        let kernel = weights.reversed() + weights.dropFirst()        // symmetric, 2 × radius + 1 long
+        var total = 0.0
+        for w in kernel { total += w }
+        values.withUnsafeBufferPointer { v in
+            kernel.withUnsafeBufferPointer { k in
+                out.withUnsafeMutableBufferPointer { o in
+                    vDSP_convD(v.baseAddress!, 1, k.baseAddress!, 1, o.baseAddress! + radius, 1,
+                               vDSP_Length(interior), vDSP_Length(kernel.count))
+                    vDSP_vsdivD(o.baseAddress! + radius, 1, &total, o.baseAddress! + radius, 1, vDSP_Length(interior))
+                }
+            }
         }
         return out
     }

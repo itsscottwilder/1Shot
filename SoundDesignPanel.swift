@@ -10,6 +10,14 @@ final class SoundDesignPanel: NSVisualEffectView {
     private let rack: AudioRack
     private let meter = MeterView()
     private var meterTimer: Timer?
+
+    /// Stops the meters' 30-times-a-second timer (the window is going away).
+    func stopMeters() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+    }
+
+    deinit { meterTimer?.invalidate() }
     private let isolationAmount = ResetSlider()
     private let isolationModel = NSSlider()
     private let isolationAmountLabel = NSTextField(labelWithString: "Off")

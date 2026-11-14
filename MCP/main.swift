@@ -101,16 +101,21 @@ enum App {
 
         var reply = Data()
         var chunk = [UInt8](repeating: 0, count: 65_536)
-        while reply.firstIndex(of: 0x0A) == nil {
+        // Only the newly read bytes are searched for the end of the answer (an answer with
+        // pictures in it is megabytes long; searching all of it after every read adds up).
+        var end: Data.Index?
+        while end == nil {
             let n = read(fd, &chunk, chunk.count)
             if n < 0 && errno == EINTR { continue }
             if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
                 throw HelperError("1Shot didn't answer for 2 minutes. A dialog may be open in the app; ask the user to check it.")
             }
             if n <= 0 { throw HelperError("1Shot closed the connection (did it quit?).") }
+            let searched = reply.count
             reply.append(contentsOf: chunk[0..<n])
+            end = reply[(reply.startIndex + searched)...].firstIndex(of: 0x0A)
         }
-        let line = reply.prefix(upTo: reply.firstIndex(of: 0x0A)!)
+        let line = reply.prefix(upTo: end!)
         guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
             throw HelperError("1Shot sent an answer that isn't JSON.")
         }

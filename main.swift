@@ -127,11 +127,15 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var visualGroups: [VisualGroup] = VisualGroup.defaults
     var activeVisualGroup = VisualGroup.arollID
     var selectedVisualClip: VisualClip?
-    var visualLUTCache: [String: CubeLUT] = [:]
     var resumeAfterScrub = false
     lazy var graphicsPanel = TimelineListPanel(title: "Graphics", subtitle: "Plates in timeline order. Drag a plate on the timeline to move it in time; select one to resize or move it on screen.", thumbnails: true, accessory: plateControls)
     var zoomRowMap: [(punch: Int, reset: Int?)] = []
-    var listThumbCache: [String: NSImage] = [:]
+    var listThumbCache: [String: NSImage] = [:]          // B-roll list thumbnails, by file + source time
+    var brollThumbsLoading: Set<String> = []             // …and the ones being made right now
+    /// Graphics list thumbnails, one per plate: redrawn only when the plate (or the style) changes.
+    var plateThumbCache: [String: (plate: GraphicPlate, style: String, image: NSImage)] = [:]
+    /// The edit transcript as last read from disk (re-read only when the file changes).
+    private var transcriptCache: (url: URL, modified: Date, size: Int, transcript: EditTranscript)?
     private(set) var currentTab: WorkspaceTab = .visualDesign
     /// Assets tab (3.1.0): the project's source clips for the assembled A-roll.
     var assets: [AssetEntry] = []
@@ -221,11 +225,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             self.player?.pause()
             let resume = finished && self.resumeAfterScrub
             if finished { self.scrubInProgress = false; self.resumeAfterScrub = false }
-            self.player?.seek(to: CMTime(seconds: self.toComp(time), preferredTimescale: 600),
-                               toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] done in
-                guard done, resume else { return }
-                DispatchQueue.main.async { self?.player?.play() }
-            }
+            self.chaseSeek(to: CMTime(seconds: self.toComp(time), preferredTimescale: 600),
+                           then: resume ? { [weak self] in self?.player?.play() } : nil)
         }
 
         // Right panel (3.0.0): a permanent sidebar whose content follows the selected tab.
@@ -901,6 +902,40 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         guard !isExporting, let p = player else { return }
         p.pause()
         seekExactly(p, to: p.currentTime().seconds + Double(direction))
+    }
+
+    // MARK: Scrubbing (one seek at a time)
+
+    private var chaseTarget: CMTime?
+    private var chaseThen: (() -> Void)?
+    private weak var chasePlayer: AVPlayer?      // the player with a scrub seek in flight (nil = none)
+
+    /// Seeks exactly to `time` for a drag (scrubbing, a trim handle). Only one seek runs at a time:
+    /// while it does, the newest place asked for is remembered and sought as soon as it lands.
+    /// Asking AVPlayer for a new exact seek on every mouse event instead cancels the one before it,
+    /// so on heavy footage the picture doesn't update until the mouse stops.
+    /// `then` runs after the seek to `time` finishes, unless a newer request replaced it.
+    func chaseSeek(to time: CMTime, then: (() -> Void)? = nil) {
+        chaseTarget = time
+        chaseThen = then
+        if let busy = chasePlayer, busy === player { return }
+        runChaseSeek()
+    }
+
+    private func runChaseSeek() {
+        guard let p = player, let target = chaseTarget else { chasePlayer = nil; return }
+        let then = chaseThen
+        chaseTarget = nil
+        chaseThen = nil
+        chasePlayer = p
+        p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak p] finished in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.chasePlayer === p { self.chasePlayer = nil }
+                if self.chaseTarget != nil { self.runChaseSeek() }      // the mouse moved on meanwhile
+                else if finished { then?() }
+            }
+        }
     }
 
     private func seekExactly(_ p: AVPlayer, to seconds: Double) {
@@ -2163,7 +2198,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         do {
-            set(try CubeLUT(url: url))
+            set(try CubeLUT.cached(url: url))
             NSLog("1Shot: \(slot == .camera ? "camera" : "creative") LUT \(url.lastPathComponent) applied")
         } catch {
             set(nil)
@@ -2309,7 +2344,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         // Preview the frame under the handle; when you let go of the end handle, park at the start.
         if finished { updateFade() }
         let target = (movingStart || finished) ? start : end
-        p.seek(to: CMTime(seconds: toComp(target), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        chaseSeek(to: CMTime(seconds: toComp(target), preferredTimescale: 600))
     }
 
     /// Sets the player's in/out points (original-clip times → edited timeline).
@@ -2516,8 +2551,20 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     func currentTranscript() -> (transcript: EditTranscript, url: URL)? {
         guard let project, let rel = project.data.transcript else { return nil }
         let url = project.folder.appendingPathComponent(rel)
-        guard let data = try? Data(contentsOf: url),
-              let t = try? JSONDecoder().decode(EditTranscript.self, from: data) else { return nil }
+        // This is asked for often (every status check from Claude asks twice), and a long
+        // recording's transcript is every word with its timing: decode it once per file change.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modified = attrs?[.modificationDate] as? Date
+        let size = (attrs?[.size] as? NSNumber)?.intValue
+        let t: EditTranscript
+        if let hit = transcriptCache, hit.url == url, hit.modified == modified, hit.size == size {
+            t = hit.transcript
+        } else {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(EditTranscript.self, from: data) else { return nil }
+            t = decoded
+            if let modified, let size { transcriptCache = (url, modified, size, decoded) }
+        }
         if currentVideo == nil {
             guard sourceAsset != nil, let recipe = arollRecipe, t.source == recipe else { return nil }
         } else if t.source != nil {
@@ -2674,6 +2721,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         saveProject()
         autosaveTimer?.invalidate(); autosaveTimer = nil
         histogramTimer?.invalidate(); histogramTimer = nil
+        history.detach()
+        drawer.stopMeters()
         if let timeObserver, let player { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
