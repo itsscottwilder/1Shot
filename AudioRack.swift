@@ -262,6 +262,10 @@ final class AudioRack {
     private var observations: [NSKeyValueObservation] = []
     private var itemTokens: [NSObjectProtocol] = []
     private var engineToken: NSObjectProtocol?
+
+    deinit {
+        if let engineToken { NotificationCenter.default.removeObserver(engineToken) }
+    }
     private var driftTimer: Timer?
 
     // Shown in the drawer's status line.

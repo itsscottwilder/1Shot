@@ -152,12 +152,19 @@ final class GainReductionMeter: NSView {
     private var shown: Float = 0
     private var lastUpdate = ProcessInfo.processInfo.systemUptime
     private let range: Float
-    private let ticks: [Float]
+    /// The scale's tick labels, built once (they never change).
+    private let ticks: [(db: Float, text: NSAttributedString, width: CGFloat)]
 
     /// range: full-scale reduction in dB. Compressor uses 20, limiter 10.
     init(range: Float = 20) {
         self.range = range
-        self.ticks = range <= 10 ? [0, 1, 3, 6, 10] : (range <= 20 ? [0, 3, 6, 10, 20] : [0, 10, 20, 30, 40])
+        let values: [Float] = range <= 10 ? [0, 1, 3, 6, 10] : (range <= 20 ? [0, 3, 6, 10, 20] : [0, 10, 20, 30, 40])
+        self.ticks = values.map { db in
+            let text = NSAttributedString(string: db == 0 ? "0" : "-\(Int(db))", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor])
+            return (db, text, text.size().width)
+        }
         super.init(frame: .zero)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -169,8 +176,9 @@ final class GainReductionMeter: NSView {
         let dt = Float(min(0.2, now - lastUpdate))
         lastUpdate = now
         // Snap to deeper reduction, ease back out (≈30 dB/s) so it's readable.
+        let before = shown
         shown = reduction >= shown ? reduction : max(reduction, shown - 30 * dt)
-        needsDisplay = true
+        if shown != before { needsDisplay = true }      // at rest (no reduction) there's nothing to redraw
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -186,15 +194,11 @@ final class GainReductionMeter: NSView {
         }
 
         // Scale ticks: 0 at the right, −20 at the left
-        let tickAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor]
-        for db in ticks {
-            let x = bar.maxX - CGFloat(db / range) * bar.width
+        for tick in ticks {
+            let x = bar.maxX - CGFloat(tick.db / range) * bar.width
             NSColor(white: 1, alpha: 0.25).setFill()
             NSRect(x: x - 0.5, y: bar.maxY + 1, width: 1, height: 3).fill()
-            let t = NSAttributedString(string: db == 0 ? "0" : "-\(Int(db))", attributes: tickAttrs)
-            t.draw(at: NSPoint(x: min(max(0, x - t.size().width / 2), bar.maxX - t.size().width), y: bar.maxY + 3))
+            tick.text.draw(at: NSPoint(x: min(max(0, x - tick.width / 2), bar.maxX - tick.width), y: bar.maxY + 3))
         }
 
         let valueAttrs: [NSAttributedString.Key: Any] = [

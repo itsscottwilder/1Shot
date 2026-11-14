@@ -75,8 +75,17 @@ final class EditHistory {
 
     func attach(to controller: PlayerWindowController) {
         self.controller = controller
+        timer?.invalidate()
         timer = Timer.everyMode(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.tick() }
     }
+
+    /// Stops watching (the window is going away). Without this the timer keeps firing for good.
+    func detach() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    deinit { timer?.invalidate() }
 
     private func tick() {
         guard let c = controller, !restoring, let now = c.editState() else { return }

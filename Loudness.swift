@@ -101,21 +101,29 @@ final class LUFSMeter {
         let right = data[min(1, channels - 1)] + from      // mono plays as both sides, like the export
         let g = Double(gain)
         lock.lock(); defer { lock.unlock() }
+        // The filters and running totals are worked on as locals and put back afterwards (same
+        // arithmetic, same order): reaching into the arrays for every sample costs a bounds and
+        // access check each time, and exports run this over the whole edit.
+        var shelfL = shelf[0], shelfR = shelf[1], highL = highPass[0], highR = highPass[1]
+        var sum = blockSum, count = blockCount, top = peak
+        let size = blockSize
         for i in 0..<n {
             let l = Double(left[i]) * g, r = Double(right[i]) * g
             let a = abs(l), b = abs(r)
-            if a > peak { peak = a }
-            if b > peak { peak = b }
-            let kl = highPass[0].run(shelf[0].run(l))
-            let kr = highPass[1].run(shelf[1].run(r))
-            blockSum += kl * kl + kr * kr
-            blockCount += 1
-            if blockCount == blockSize {
-                finishBlock(blockSum / Double(blockSize))
-                blockSum = 0
-                blockCount = 0
+            if a > top { top = a }
+            if b > top { top = b }
+            let kl = highL.run(shelfL.run(l))
+            let kr = highR.run(shelfR.run(r))
+            sum += kl * kl + kr * kr
+            count += 1
+            if count == size {
+                finishBlock(sum / Double(size))
+                sum = 0
+                count = 0
             }
         }
+        shelf[0] = shelfL; shelf[1] = shelfR; highPass[0] = highL; highPass[1] = highR
+        blockSum = sum; blockCount = count; peak = top
         lastAudio = ProcessInfo.processInfo.systemUptime
     }
 
@@ -247,16 +255,18 @@ enum LoudnessScan {
             if isCancelled() { throw ScanError.cancelled }
             // Keep a little decoded audio queued ahead of the renderer.
             while !sourceEnded && scheduled < rendered + AVAudioFramePosition(chunk) * 4 {
-                guard let sample = output.copyNextSampleBuffer() else { sourceEnded = true; break }
-                guard var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) else { continue }
-                let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                if let fadeEnd { AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd) }
-                if !normalized.isEmpty {
-                    guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { continue }
-                    pcm = kept
+                autoreleasepool {       // the whole scan is one long loop: don't let buffers pile up
+                    guard let sample = output.copyNextSampleBuffer() else { sourceEnded = true; return }
+                    guard var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) else { return }
+                    let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                    if let fadeEnd { AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd) }
+                    if !normalized.isEmpty {
+                        guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { return }
+                        pcm = kept
+                    }
+                    rack.scheduleForExport(pcm)
+                    scheduled += AVAudioFramePosition(pcm.frameLength)
                 }
-                rack.scheduleForExport(pcm)
-                scheduled += AVAudioFramePosition(pcm.frameLength)
             }
             let remaining = total + latency - rendered
             if remaining <= 0 { break }

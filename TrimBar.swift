@@ -20,7 +20,10 @@ final class TrimBar: NSView {
     var playhead: Double = 0 {
         didSet {
             guard abs(playhead - oldValue) > 0.001 else { return }
-            needsDisplay = true
+            // The playhead is two small layer-backed views (see placePlayhead), so moving it during
+            // playback doesn't redraw the filmstrip and waveform 60 times a second.
+            placePlayhead()
+            if pendingCutStart != nil { needsDisplay = true }   // the cut being marked is drawn up to the playhead
             followPlayhead()
         }
     }
@@ -43,6 +46,11 @@ final class TrimBar: NSView {
     private var showsClips: Bool { clipView && !showFullAsset }
     private var layoutFrozen = false            // while an edge is dragged, the clips don't reflow
     private var segs: [(s: Double, e: Double)] = []
+    /// For each of `segs`: where it starts on the shown timeline (the lengths before it, added up),
+    /// so a time is found by binary search instead of walking every clip.
+    private var segOffsets: [Double] = []
+    private var segTotal: Double = 0
+    private var segsInOrder = true          // false only for a malformed cut list: then walk them all
     private var shownLength: Double = 0.001
     private var dragOriginX: CGFloat = 0
     private var dragOriginValue: Double = 0
@@ -55,7 +63,18 @@ final class TrimBar: NSView {
         } else {
             segs = [(s: 0, e: duration)]
         }
-        shownLength = max(0.001, segs.reduce(0) { $0 + ($1.e - $1.s) })
+        segOffsets.removeAll(keepingCapacity: true)
+        segOffsets.reserveCapacity(segs.count)
+        segsInOrder = true
+        var acc = 0.0, lastEnd = -Double.infinity
+        for g in segs {
+            segOffsets.append(acc)
+            acc += g.e - g.s
+            if !(g.e >= g.s && g.e >= lastEnd) { segsInOrder = false }
+            lastEnd = g.e
+        }
+        segTotal = acc
+        shownLength = max(0.001, acc)
         clampView()
         syncZoomSlider()
         needsDisplay = true
@@ -67,25 +86,45 @@ final class TrimBar: NSView {
     private func shown(_ t: Double) -> Double {
         guard let first = segs.first, let last = segs.last else { return t }
         if t <= first.s { return t - first.s }
-        var acc = 0.0
-        for g in segs {
-            if t <= g.e { return acc + max(0, t - g.s) }
-            acc += g.e - g.s
+        guard segsInOrder else {
+            var acc = 0.0
+            for g in segs {
+                if t <= g.e { return acc + max(0, t - g.s) }
+                acc += g.e - g.s
+            }
+            return acc + (t - last.e)
         }
-        return acc + (t - last.e)
+        // The first clip that ends at or after t.
+        var lo = 0, hi = segs.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if t <= segs[mid].e { hi = mid } else { lo = mid + 1 }
+        }
+        if lo < segs.count { return segOffsets[lo] + max(0, t - segs[lo].s) }
+        return segTotal + (t - last.e)
     }
 
     /// Place on the shown timeline → clip time.
     private func clipTime(shown d: Double) -> Double {
         guard let first = segs.first, let last = segs.last else { return d }
         if d <= 0 { return first.s + d }
-        var acc = 0.0
-        for g in segs {
-            let len = g.e - g.s
-            if d <= acc + len { return g.s + (d - acc) }
-            acc += len
+        guard segsInOrder else {
+            var acc = 0.0
+            for g in segs {
+                let len = g.e - g.s
+                if d <= acc + len { return g.s + (d - acc) }
+                acc += len
+            }
+            return last.e + (d - acc)
         }
-        return last.e + (d - acc)
+        // The first clip whose end on the shown timeline is at or after d.
+        var lo = 0, hi = segs.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if d <= segOffsets[mid] + (segs[mid].e - segs[mid].s) { hi = mid } else { lo = mid + 1 }
+        }
+        if lo < segs.count { return segs[lo].s + (d - segOffsets[lo]) }
+        return last.e + (d - segTotal)
     }
     var pendingCutStart: Double? { didSet { needsDisplay = true } }
     /// A cut was clicked (nil = clicked outside any cut).
@@ -235,12 +274,6 @@ final class TrimBar: NSView {
             NSGraphicsContext.restoreGraphicsState()
         }
         NSGraphicsContext.restoreGraphicsState()
-        // The playhead runs through V2 too, down to the clips.
-        let px = x(for: playhead)
-        if px >= stripRect.minX - 1 && px <= stripRect.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: px - 1, y: lane.minY, width: 2, height: stripRect.minY - lane.minY).fill()
-        }
     }
 
     @objc private func removeBrollChosen(_ sender: NSMenuItem) { onRemoveBroll?(sender.tag) }
@@ -281,15 +314,67 @@ final class TrimBar: NSView {
     private let zoomInButton = NSButton()
     private let zoomControlsWidth: CGFloat = 170
 
+    /// The playhead: a white line through V2, V1 and A1, and a tick on the overview bar. They are
+    /// views with their own layers, so moving them is a layer move, not a redraw of the strip.
+    private final class PlayheadMark: NSView {
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            layer?.backgroundColor = NSColor.white.cgColor
+            isHidden = true
+        }
+        required init?(coder: NSCoder) { fatalError() }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }      // clicks go to the strip
+    }
+    private let playheadLine = PlayheadMark()
+    private let playheadOverviewTick = PlayheadMark()
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         registerForDraggedTypes([.fileURL])
+        addSubview(playheadLine)
+        addSubview(playheadOverviewTick)
         setUpZoomControls()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        addSubview(playheadLine)
+        addSubview(playheadOverviewTick)
         setUpZoomControls()
+    }
+
+    /// Puts the playhead marks where the playhead is now. Called when the playhead moves and, through
+    /// viewWillDraw, whenever anything that places it (zoom, scroll, cuts, size) has changed.
+    private func placePlayhead() {
+        guard duration > 0 else {
+            playheadLine.isHidden = true
+            playheadOverviewTick.isHidden = true
+            return
+        }
+        let strip = stripRect
+        let px = x(for: playhead)
+        let onStrip = px >= strip.minX - 1 && px <= strip.maxX + 1
+        if onStrip {
+            let top = laneRect.minY, bottom = audioLaneRect.maxY
+            let frame = NSRect(x: px - 1, y: top, width: 2, height: bottom - top)
+            if playheadLine.frame != frame { playheadLine.frame = frame }
+        }
+        if playheadLine.isHidden == onStrip { playheadLine.isHidden = !onStrip }
+
+        let zoomed = zoom > 1.0001
+        if zoomed {
+            let o = overviewRect
+            let ox = o.minX + CGFloat(shown(playhead) / shownLength) * o.width
+            let frame = NSRect(x: ox - 0.5, y: o.minY - 1, width: 1, height: o.height + 2)
+            if playheadOverviewTick.frame != frame { playheadOverviewTick.frame = frame }
+        }
+        if playheadOverviewTick.isHidden == zoomed { playheadOverviewTick.isHidden = !zoomed }
+    }
+
+    override func viewWillDraw() {
+        super.viewWillDraw()
+        placePlayhead()
     }
 
     override func viewDidMoveToWindow() {
@@ -483,10 +568,23 @@ final class TrimBar: NSView {
     /// Asked for frames at these times (key = seconds × 100). Answer with setThumbnail(_:forKey:).
     var onNeedThumbnails: (([Int]) -> Void)?
 
+    /// Tiles kept at once. Each is up to 400 px wide (about 360 KB decoded), so this is ~100 MB at most.
+    private static let zoomThumbLimit = 300
+
     func setThumbnail(_ image: CGImage, forKey key: Int) {
-        if zoomThumbs.count > 800 { zoomThumbs.removeAll() }
+        if zoomThumbs.count >= Self.zoomThumbLimit { evictDistantThumbs() }
         zoomThumbs[key] = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
         needsDisplay = true
+    }
+
+    /// Drops the tiles more than a screen away from what's showing (they are fetched again if you
+    /// scroll back), and forgets they were asked for so the strip can ask again.
+    private func evictDistantThumbs() {
+        let lo = clipTime(shown: viewStart - visibleLength)
+        let hi = clipTime(shown: viewStart + 2 * visibleLength)
+        let gone = zoomThumbs.keys.filter { let t = Double($0) / 100; return !(t >= lo && t <= hi) }
+        for key in gone { zoomThumbs.removeValue(forKey: key) }
+        requestedThumbs.subtract(gone)
     }
 
     /// A request was cancelled (you zoomed again first): allow asking for these again.
@@ -717,12 +815,6 @@ final class TrimBar: NSView {
             yellow.setFill()
         }
 
-        // Playhead
-        let px = x(for: playhead)
-        if px >= strip.minX - 1 && px <= strip.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: px - 1, y: strip.minY - 6, width: 2, height: strip.height + 12).fill()
-        }
         NSGraphicsContext.restoreGraphicsState()
 
         // Overview bar (only when zoomed in)
@@ -740,8 +832,6 @@ final class TrimBar: NSView {
             NSBezierPath(roundedRect: thumb, xRadius: 2, yRadius: 2).fill()
             NSColor.white.withAlphaComponent(0.8).setStroke()
             NSBezierPath(roundedRect: thumb, xRadius: 2, yRadius: 2).stroke()
-            NSColor.white.setFill()
-            NSRect(x: ox(playhead) - 0.5, y: o.minY - 1, width: 1, height: o.height + 2).fill()
         }
 
         drawBrollLane()
@@ -849,12 +939,6 @@ final class TrimBar: NSView {
         }
         NSColor.white.withAlphaComponent(0.08).setFill()
         NSRect(x: lane.minX, y: midY, width: lane.width, height: 0.5).fill()
-        // The playhead runs through A1 too.
-        let x0 = x(for: playhead)
-        if x0 >= lane.minX - 1 && x0 <= lane.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: x0 - 1, y: lane.minY, width: 2, height: lane.height).fill()
-        }
         NSGraphicsContext.restoreGraphicsState()
     }
 

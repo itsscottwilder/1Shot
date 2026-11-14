@@ -106,7 +106,15 @@ final class BrollRenderer {
     private let lock = NSLock()
     private var _shots: [Shot] = []
     private var _cuts: [Cut] = []
-    private var generators: [URL: AVAssetImageGenerator] = [:]
+    /// One frame reader per B-roll video, with the video's length (looked up once, not per frame).
+    private struct Decoder { let generator: AVAssetImageGenerator; let duration: Double }
+    private var decoders: [URL: Decoder] = [:]
+    private var decoderOrder: [URL] = []          // least recently used first
+    /// Each reader holds its own video decoders, so only the most recently used few are kept.
+    private static let maxDecoders = 6
+    /// The last frame decoded. While paused, every slider tick re-renders the same frame — this
+    /// saves decoding it again each time.
+    private var lastFrame: (url: URL, time: CMTime, image: CIImage)?
     private var photos: [URL: CIImage] = [:]
 
     func update(shots: [Shot], cuts: [Cut]) {
@@ -176,23 +184,45 @@ final class BrollRenderer {
         return img
     }
 
-    private func frame(_ url: URL, at seconds: Double, extent: CGRect) -> CIImage? {
+    private func decoder(for url: URL, extent: CGRect) -> Decoder {
         lock.lock()
-        let gen: AVAssetImageGenerator
-        if let g = generators[url] { gen = g } else {
-            gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-            gen.appliesPreferredTrackTransform = true
-            gen.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 60)
-            gen.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 60)
-            gen.maximumSize = CGSize(width: extent.width * 1.2, height: extent.height * 1.2)
-            generators[url] = gen
+        if let d = decoders[url] {
+            if decoderOrder.last != url {
+                decoderOrder.removeAll { $0 == url }
+                decoderOrder.append(url)
+            }
+            lock.unlock()
+            return d
         }
         lock.unlock()
-        let duration = gen.asset.duration.seconds
+        // Made outside the lock: reading the length can take a moment, and the main thread
+        // takes this lock too.
+        let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = CMTime(value: 1, timescale: 60)
+        gen.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 60)
+        gen.maximumSize = CGSize(width: extent.width * 1.2, height: extent.height * 1.2)
+        let made = Decoder(generator: gen, duration: gen.asset.duration.seconds)
+        lock.lock(); defer { lock.unlock() }
+        if let d = decoders[url] { return d }       // another render thread got there first
+        decoders[url] = made
+        decoderOrder.append(url)
+        while decoderOrder.count > Self.maxDecoders { decoders.removeValue(forKey: decoderOrder.removeFirst()) }
+        return made
+    }
+
+    private func frame(_ url: URL, at seconds: Double, extent: CGRect) -> CIImage? {
+        let decoder = decoder(for: url, extent: extent)
+        let duration = decoder.duration
         let t = duration.isFinite && duration > 0.1 ? min(seconds, duration - 0.05) : seconds
-        guard let cg = try? gen.copyCGImage(at: CMTime(seconds: max(0, t), preferredTimescale: 600), actualTime: nil)
-        else { return nil }
-        return CIImage(cgImage: cg)
+        let time = CMTime(seconds: max(0, t), preferredTimescale: 600)
+        lock.lock()
+        if let last = lastFrame, last.url == url, last.time == time { lock.unlock(); return last.image }
+        lock.unlock()
+        guard let cg = try? decoder.generator.copyCGImage(at: time, actualTime: nil) else { return nil }
+        let image = CIImage(cgImage: cg)
+        lock.lock(); lastFrame = (url, time, image); lock.unlock()
+        return image
     }
 }
 

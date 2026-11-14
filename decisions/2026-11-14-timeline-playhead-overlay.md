@@ -1,0 +1,6 @@
+## Decision: The timeline playhead is two layer-backed subviews of TrimBar, not part of TrimBar.draw
+## Context: The 60 Hz playback observer set `TrimBar.playhead`, which invalidated the whole strip, so the filmstrip, the per-pixel waveform and every cut were redrawn each video frame. On a 1080p test clip with 100 cuts that was most of the app's playback CPU (125–130 % of a core before, 49–65 % after).
+## Alternatives considered: (1) `setNeedsDisplay(_ rect:)` for the old and new playhead columns and honoring `dirtyRect` everywhere in `draw` — keeps one view but every loop in `draw` would need a dirty-range version, and the draw function would still run per frame. (2) Sublayers added straight to TrimBar's own backing layer — AppKit owns that layer; unsupported.
+## Reasoning: Moving a layer-backed subview is a compositor operation, so playback costs no drawing at all. `placePlayhead()` is called from `playhead.didSet` and from `viewWillDraw()`, so anything that changes the geometry (zoom, scroll, cuts, resize) already triggers it without separate bookkeeping. The marks return nil from `hitTest`, so mouse handling is unchanged.
+## Trade-offs accepted: The playhead is always the top-most thing on the strip. While a cut is being marked (X key) the strip still redraws per frame, because that red region is drawn up to the playhead.
+## Supersedes: none
