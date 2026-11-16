@@ -172,6 +172,17 @@ final class ColorGrade {
                               forDisplay: Bool = false) -> AVVideoComposition {
         let comp = AVMutableVideoComposition(asset: asset) { [weak self] request in
             let source = request.sourceImage
+            // The frame's real size (3.3.2). Now and then AVFoundation hands over a source image with
+            // an infinite or empty extent (seen while dragging plates on an A-roll of HEVC clips);
+            // drawing B-roll and graphics into that crashed the app (Int(extent.width) trapped).
+            let frame: CGRect = {
+                let e = source.extent
+                if e.isInfinite || e.isNull || e.isEmpty || !e.width.isFinite || !e.height.isFinite
+                    || e.width > 32_768 || e.height > 32_768 {
+                    return CGRect(origin: .zero, size: request.renderSize)
+                }
+                return e
+            }()
             guard let self else { request.finish(with: source, context: nil); return }
             // Time on the original clip (differs from the player's time when cuts are taken out).
             let clipTime = mapTime.map { CMTime(seconds: $0(request.compositionTime.seconds), preferredTimescale: 60_000) }
@@ -189,7 +200,7 @@ final class ColorGrade {
             // Punch-in zoom: scale around a point a little above center (keeps the eyes high).
             // Scaling around the eyes keeps them exactly where they were in the wide frame.
             if let z = ZoomList.active(at: clipTime.seconds, in: self.zooms), z.scale > 1.001 {
-                let e = source.extent
+                let e = frame
                 let ax = e.minX + e.width * CGFloat(z.anchorX ?? 0.5)
                 let ay = e.maxY - e.height * CGFloat(z.anchorY ?? ZoomList.anchorFromTop)
                 let k = CGFloat(z.scale)
@@ -199,26 +210,26 @@ final class ColorGrade {
             }
             // White balance goes BEFORE the LUT, like setting it in the camera: a log/conversion
             // LUT expects a neutral picture going in, and correcting after it can't fully undo a cast.
-            var graded = ColorGrade.grade(image.cropped(to: source.extent), s, lut: lut, creativeLUT: creativeLUT)
+            var graded = ColorGrade.grade(image.cropped(to: frame), s, lut: lut, creativeLUT: creativeLUT)
 
             // B-roll (V2) covers the talking head while it's on, graded by its own group's look.
             // A picture-in-picture shot (3.2) sits in its box over the talking head instead.
-            if let (b, group, pip) = self.broll.image(at: clipTime.seconds, extent: source.extent) {
+            if let (b, group, pip) = self.broll.image(at: clipTime.seconds, extent: frame) {
                 var shot = b
                 if var g = self.groupGrade(group), !g.isNeutral {
                     if bypass { g.settings = ColorGrade.bypassedSettings(g.settings) }
                     shot = ColorGrade.grade(b, g.settings, lut: g.lut, creativeLUT: g.creativeLUT)
                 }
                 if let pip {
-                    graded = BrollRenderer.placeInPicture(shot, pip, extent: source.extent).composited(over: graded)
+                    graded = BrollRenderer.placeInPicture(shot, pip, extent: frame).composited(over: graded)
                 } else {
                     graded = shot
                 }
             }
 
             // Motion graphics (V3) on top; the fade to black below covers them too.
-            if includeGraphics, let g = self.graphics.image(at: clipTime.seconds, extent: source.extent) {
-                graded = g.composited(over: graded).cropped(to: source.extent)
+            if includeGraphics, let g = self.graphics.image(at: clipTime.seconds, extent: frame) {
+                graded = g.composited(over: graded).cropped(to: frame)
             }
 
             // Fade to black over the last half second before the (trimmed) end.

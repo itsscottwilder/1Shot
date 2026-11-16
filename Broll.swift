@@ -115,6 +115,8 @@ final class BrollRenderer {
 
     /// The B-roll picture for clip time `t`, filling `extent`, or nil when no B-roll is on.
     func image(at t: Double, extent: CGRect) -> (CIImage, String?, PiP?)? {
+        guard extent.width.isFinite, extent.height.isFinite, extent.width >= 1, extent.height >= 1,
+              extent.width <= 32_768, extent.height <= 32_768 else { return nil }   // never draw into an unreal frame (3.3.2)
         lock.lock(); let shots = _shots; let cuts = _cuts; let live = _live; lock.unlock()
         let edited = t - CutList.removed(before: t, cuts: cuts)
         for s in shots {

@@ -67,6 +67,7 @@ final class EditHistory {
     private var seen: EditState?           // the latest picture, to tell when changes stop
     private var changedAt: TimeInterval = 0
     private var identity: [URL?] = []      // project + video; a new one starts the history over
+    private var aroll: ObjectIdentifier?   // the assembled A-roll; rebuilding it starts the history over too
     private var restoring = false
 
     init() {
@@ -81,8 +82,10 @@ final class EditHistory {
     private func tick() {
         guard let c = controller, !restoring, let now = c.editState() else { return }
         let id: [URL?] = [c.project?.fileURL.standardizedFileURL, c.currentVideo?.standardizedFileURL]
-        if id != identity || settled == nil {
+        let built = c.currentVideo == nil ? c.sourceAsset.map(ObjectIdentifier.init) : nil
+        if id != identity || built != aroll || settled == nil {
             identity = id
+            aroll = built
             settled = now
             seen = now
             undoManager.removeAllActions()
@@ -166,8 +169,14 @@ extension PlayerWindowController {
     /// The edit as it is right now, or nil while there's nothing to undo (loading, exporting, no video).
     func editState() -> EditState? {
         guard player != nil, trimBar.duration > 0, pendingRestore == nil, !isExporting,
-              let video = currentVideo,
-              (sourceAsset as? AVURLAsset)?.url.standardizedFileURL == video.standardizedFileURL else { return nil }
+              let asset = sourceAsset else { return nil }
+        if let video = currentVideo {
+            // A single file: only once that file is the one playing.
+            guard (asset as? AVURLAsset)?.url.standardizedFileURL == video.standardizedFileURL else { return nil }
+        } else {
+            // An assembled A-roll from the Assets tab (3.3.2: before this, multi-clip projects had no undo).
+            guard asset is AVComposition else { return nil }
+        }
         // The trim strip's own values (the player's in/out points pick up rounding when cuts change).
         let trim: [Double]? = isTrimmed ? [trimBar.start, trimBar.end] : nil
         return EditState(color: exportDrawer.snapshot, audio: drawer.snapshot,

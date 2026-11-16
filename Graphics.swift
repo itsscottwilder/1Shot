@@ -138,6 +138,8 @@ final class GraphicsRenderer {
 
     /// The graphics for clip time `t` over a frame of `extent`, or nil when none is on.
     func image(at t: Double, extent: CGRect) -> CIImage? {
+        guard extent.width.isFinite, extent.height.isFinite, extent.width >= 1, extent.height >= 1,
+              extent.width <= 32_768, extent.height <= 32_768 else { return nil }   // never draw into an unreal frame (3.3.2)
         let tune = GraphicsTuningStore.current
         lock.lock(); let plates = _plates; let cuts = _cuts; let live = _live; lock.unlock()
         let red = GraphicsStyle.red
@@ -314,6 +316,8 @@ enum PlateDrawing {
 
     /// One element as its own picture.
     static func renderElement(_ e: Elem, scale s: CGFloat) -> CGImage? {
+        let fw = e.rect.width * s, fh = e.rect.height * s
+        guard fw.isFinite, fh.isFinite, fw < 16_384, fh < 16_384 else { return nil }
         let w = Int((e.rect.width * s).rounded(.up)), h = Int((e.rect.height * s).rounded(.up))
         guard w > 0, h > 0, w < 16384, h < 16384, let space = CGColorSpace(name: CGColorSpace.sRGB),
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
