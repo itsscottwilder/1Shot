@@ -376,6 +376,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     func load(_ url: URL, assetID: UUID? = nil) {
         trimBar.sourceClipBoundaries = []
         trimBar.sourceClipCount = 0
+        arollPieces = []
         if project?.contains(url) != true { RecentFiles.add(url) }   // a project is listed by its project file instead
         if url.standardizedFileURL != currentVideo?.standardizedFileURL { setCuts([]) }   // cuts belong to a clip
         currentVideo = url
@@ -2430,6 +2431,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
                 return cursor
             }
             self.trimBar.sourceClipCount = included.count
+            self.arollPieces = self.makeArollPieces(included, in: project)
             self.loadComposition(comp)
             self.arollRecipe = Self.arollRecipe(included)
             if !restoring { self.selectTab(.visualDesign) }
@@ -2482,6 +2484,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
                 return cursor
             }
             self.trimBar.sourceClipCount = newIncluded.count
+            self.arollPieces = self.makeArollPieces(newIncluded, in: project)
             self.loadComposition(comp)
             self.arollRecipe = Self.arollRecipe(newIncluded)
             // Persist the asset trims immediately; the player is loaded asynchronously.
@@ -2569,6 +2572,43 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     /// being resized ran the system's video decoder service up to ~10 GB and froze the Mac.
     /// Requests are also gathered for a moment, so a resize drag asks once when it pauses, not every frame.
     private var zoomThumbGenerator: AVAssetImageGenerator?
+    private var zoomThumbTask: Task<Void, Never>?
+    private var filmstripTask: Task<Void, Never>?
+
+    /// One clip of an assembled A-roll: where it sits on the timeline and where that part
+    /// comes from in its own file. Timeline thumbnails are taken from the file itself (3.3.1):
+    /// AVAssetImageGenerator can't decode across the joins of an A-roll made of HEVC clips
+    /// ("Cannot Decode" for everything after the first clip), though playback is fine.
+    struct ArollPiece {
+        let start: Double          // on the A-roll
+        let end: Double
+        let inPoint: Double        // in the clip file
+        let asset: AVURLAsset
+    }
+    var arollPieces: [ArollPiece] = []
+
+    func makeArollPieces(_ included: [AssetEntry], in project: Project) -> [ArollPiece] {
+        var cursor = 0.0
+        return included.map { entry in
+            let length = max(0, entry.outPoint - entry.inPoint)
+            defer { cursor += length }
+            return ArollPiece(start: cursor, end: cursor + length, inPoint: entry.inPoint,
+                              asset: AVURLAsset(url: project.folder.appendingPathComponent(entry.path)))
+        }
+    }
+
+    /// A small frame (up to 400 px) of the A-roll at `t`, read from the clip file it comes from.
+    static func pieceImage(_ pieces: [ArollPiece], at t: Double, tolerance: Double) async -> CGImage? {
+        guard let piece = pieces.last(where: { t >= $0.start }) ?? pieces.first else { return nil }
+        let local = piece.inPoint + min(max(0, t - piece.start), max(0, piece.end - piece.start - 0.01))
+        let generator = AVAssetImageGenerator(asset: piece.asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 400, height: 400)
+        let tol = CMTime(seconds: tolerance, preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = tol
+        generator.requestedTimeToleranceAfter = tol
+        return try? await generator.image(at: CMTime(seconds: local, preferredTimescale: 600)).image
+    }
     private var zoomThumbPending: [Int] = []
     private var zoomThumbWanted = Set<Int>()
     private var zoomThumbWork: DispatchWorkItem?
@@ -2588,6 +2628,26 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         zoomThumbWanted.removeAll()
         guard let asset = sourceAsset, !keys.isEmpty else {
             trimBar.forgetThumbnailRequests(keys)
+            return
+        }
+        if !arollPieces.isEmpty {
+            // An assembled A-roll: each frame comes from its own clip file (see ArollPiece).
+            let newKeys = Set(keys)
+            trimBar.forgetThumbnailRequests(zoomThumbPending.filter { !newKeys.contains($0) })
+            zoomThumbTask?.cancel()
+            zoomThumbPending = keys
+            let pieces = arollPieces
+            zoomThumbTask = Task { [weak self] in
+                for key in keys.sorted() {
+                    if Task.isCancelled { return }
+                    let image = await Self.pieceImage(pieces, at: Double(key) / 100, tolerance: 0.1)
+                    await MainActor.run {
+                        guard let self, !Task.isCancelled else { return }
+                        self.zoomThumbPending.removeAll { $0 == key }
+                        if let image { self.trimBar.setThumbnail(image, forKey: key) }
+                    }
+                }
+            }
             return
         }
         let generator: AVAssetImageGenerator
@@ -2629,6 +2689,25 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     private func makeThumbnails(asset: AVAsset, duration: Double) {
         let count = 20
         trimBar.resetThumbnails(count: count)
+        if !arollPieces.isEmpty {
+            // An assembled A-roll: each frame comes from its own clip file (see ArollPiece).
+            let pieces = arollPieces
+            thumbnailGenerator = nil
+            filmstripTask?.cancel()
+            filmstripTask = Task { [weak self] in
+                for i in 0..<count {
+                    if Task.isCancelled { return }
+                    let t = duration * (Double(i) + 0.5) / Double(count)
+                    guard let image = await Self.pieceImage(pieces, at: t, tolerance: max(0.5, duration / Double(count) / 2)) else { continue }
+                    await MainActor.run {
+                        guard let self, !Task.isCancelled else { return }
+                        self.trimBar.setThumbnail(image, at: i)
+                    }
+                }
+            }
+            return
+        }
+        filmstripTask?.cancel()
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 400, height: 400)
