@@ -7,7 +7,7 @@ import AVFoundation
 
 private struct DeEsserState {
     // Settings
-    var frequency: Float = 6000
+    var frequency: Float = 4500
     var threshold: Float = 0.1             // linear level of the "s" band where reduction starts
     var active = false
     // High-pass biquad (RBJ), shared coefficients

@@ -217,7 +217,7 @@ final class AudioRack {
     // De-esser, after the compressor. Amount 0 = off (out of the chain).
     private var deEsser: AVAudioUnit?
     private var deEsserAttached = false
-    private(set) var deEsserFrequency: Double = 6000
+    private(set) var deEsserFrequency: Double = 4500
     private(set) var deEsserAmount: Double = 0
     private var deEsserOn: Bool { deEsser != nil && deEsserAmount > 0.5 && !bypassed.contains(.deEsser) }
 

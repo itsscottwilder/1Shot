@@ -30,7 +30,7 @@ final class SoundDesignPanel: NSVisualEffectView {
     private let gainReduction = GainReductionMeter()
     private let deEssFrequency = ResetSlider()
     private let deEssAmount = ResetSlider()
-    private let deEssFrequencyLabel = NSTextField(labelWithString: "6.0 kHz")
+    private let deEssFrequencyLabel = NSTextField(labelWithString: "4.5 kHz")
     private let deEssAmountLabel = NSTextField(labelWithString: "Off")
     private let deEssReduction = GainReductionMeter(range: 20)
     private let limiterInput = ResetSlider()
@@ -197,9 +197,9 @@ final class SoundDesignPanel: NSVisualEffectView {
         dsTitle.font = .systemFont(ofSize: 12, weight: .semibold)
         stack.addArrangedSubview(dsTitle)
         stack.setCustomSpacing(6, after: dsTitle)
-        configure(deEssFrequency, min: 4, max: 10, value: 6,
-                  help: "Where harsh “s” sounds start for your voice (4–10 kHz) · double-click for 6 kHz")
-        deEssFrequency.resetValue = 6
+        configure(deEssFrequency, min: 4, max: 10, value: 4.5,
+                  help: "Where harsh “s” sounds start for your voice (4–10 kHz) · double-click for 4.5 kHz")
+        deEssFrequency.resetValue = 4.5
         deEssFrequency.action = #selector(deEsserChanged(_:))
         configure(deEssAmount, min: 0, max: 100, value: 0,
                   help: "How strongly “s” sounds are tamed. 0 = off · double-click to turn off")
