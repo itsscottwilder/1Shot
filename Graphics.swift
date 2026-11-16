@@ -25,7 +25,7 @@ struct GraphicPlate: Codable, Equatable {
     var subtitle: String? = nil
     var items: [String]? = nil     // bullets / bar sections
     var side: String? = nil        // overlays: which side the TEXT goes ("left" default, or "right")
-    var style: String? = nil       // bullets and keyword: "clean" (default) or "panel"
+    var style: String? = nil       // bullets, keyword and circle: "clean" (default) or "panel"
     var build: Bool? = nil         // bullets / top bar: items appear one at a time
     var builds: [Double]? = nil    // original-clip seconds each item appears (from the transcript)
     var current: Int? = nil        // top bar: highlighted section (0-based) when not building
@@ -63,7 +63,7 @@ enum GraphicsTemplates {
               fields: "title (a short line; words pop in one by one beside the speaker; *marked* words get the red marker swipe), subtitle (optional sticker under it, as wide as the title), side, style clean|panel (panel puts it on a rounded black box). Use this instead of a full-screen statement.",
               example: ["title": "People are *people.*", "side": "left"]),
         .init(name: "circle", fullScreen: false,
-              fields: "kicker (small line above), title (the big word: slams in and a red scribble circles it), side.",
+              fields: "kicker (small line above), title (the big word: slams in and a red scribble circles it), side, style clean|panel (panel puts it on a rounded black box; use it over bright screens).",
               example: ["kicker": "Change your", "title": "surroundings", "side": "left"]),
         .init(name: "ring", fullScreen: false,
               fields: "No text. A red hand-drawn ring draws itself around a spot on screen (a control, the pointer, a number) to point it out. It's centered on the frame: place it with dx/dy (px from the center of a 1920×1080 frame, +dx right, +dy down) and size it with scale (1 = 220×160). Never moved to clear the speaker's face. Use snapshot_frame to find the spot.",
@@ -592,6 +592,18 @@ enum PlateDrawing {
         let top = (H - total) / 2
         let x: CGFloat = k.right ? W - 110 - max(big.width, small?.width ?? 0) : 110
         var out: [Elem] = []
+        if p.style == "panel" {
+            // A rounded black box behind the words and the ring (2026-11-15): white text on a white
+            // spreadsheet disappears otherwise. Same box as keyword's panel; wide enough for the ring.
+            let padX: CGFloat = 80, padY: CGFloat = 50
+            let box = CGRect(x: x - padX, y: top - padY,
+                             width: max(big.width + 80, small?.width ?? 0) + padX * 2 + 30,
+                             height: total + padY * 2 + 24)
+            out.append(Elem(rect: box, anim: .pop, at: 0, anchor: CGPoint(x: box.midX, y: box.midY)) { pen in
+                let path = CGPath(roundedRect: box, cornerWidth: 44, cornerHeight: 44, transform: nil)
+                pen.ctx.addPath(path); pen.ctx.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.88)); pen.ctx.fillPath()
+            })
+        }
         if let small { out += small.elements(x: x, top: top, anim: .pop, start: 0, step: 0.15, shadow: true) }
         let bigTop = top + (small?.height ?? 0) + gapBelowSmall
         out += big.elements(x: x, top: bigTop, anim: .slam, start: 0.3, step: 0.12, shadow: true)
