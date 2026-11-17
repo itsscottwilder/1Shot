@@ -2073,7 +2073,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         insertPunchIn(at: trimBar.playhead, scale: ZoomList.punchScale)
     }
 
-    /// A punch-in added by hand that goes back to normal 15 s later (ZoomList.defaultHold), or just
+    /// A punch-in added by hand that goes back to normal 5 s later (ZoomList.defaultHold), or just
     /// before the next zoom or the trim end, whichever comes first. Drag either marker (or edit In/Out
     /// in the Zooms tab) to adjust it.
     func insertPunchIn(at time: Double, scale: Double) {

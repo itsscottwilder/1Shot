@@ -57,9 +57,9 @@ enum ZoomList {
     }
 
     /// Seconds a punch-in added by hand (Z key, or right-click › Add Punch-In Here) stays in before
-    /// going back to normal (3.3.3: 15 s, was 10 s for Z and open-ended from the menu). Drag its
+    /// going back to normal (3.3.3: 5 s, was 10 s for Z and open-ended from the menu). Drag its
     /// end, or edit Out in the Zooms tab, to make it longer.
-    static let defaultHold = 15.0
+    static let defaultHold = 5.0
 
     static func parse(_ text: String) throws -> [ZoomEvent] {
         struct Wrapper: Decodable { let zooms: [ZoomEvent] }
