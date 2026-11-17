@@ -19,6 +19,8 @@ final class AssetsPanel: NSVisualEffectView {
     var onMoveToNewGroup: (([UUID]) -> Void)?
     var onMoveToGroup: (([UUID], String) -> Void)?
     var onRenameGroup: ((String, String) -> Void)?
+    /// Right-click › Delete Group… (every group but Default).
+    var onDeleteGroup: ((String) -> Void)?
     /// Reused as-is: edits the currently selected asset's in/out (the window retargets its
     /// closures; the control itself doesn't know or care what it's trimming).
     let trimPanel = TrimPanel()
@@ -86,7 +88,7 @@ final class AssetsPanel: NSVisualEffectView {
         // Visual Design groups: every group, its colour and how many clips are in it. Click a name to rename it.
         let groupsTitle = NSTextField(labelWithString: "Visual Design Groups")
         groupsTitle.font = .systemFont(ofSize: 12, weight: .semibold)
-        let groupsHint = NSTextField(labelWithString: "Click or right-click a name to rename. Right-click clips to regroup them.")
+        let groupsHint = NSTextField(labelWithString: "Right-click a group to rename or delete it. Right-click clips to regroup them.")
         groupsHint.font = .systemFont(ofSize: 10)
         groupsHint.textColor = .tertiaryLabelColor
         groupsStack.orientation = .vertical
@@ -185,6 +187,7 @@ final class AssetsPanel: NSVisualEffectView {
             let count = assets.filter { ($0.visualGroup ?? "aroll") == g.id }.count
             let row = GroupListRow(id: g.id, name: g.name, color: g.color, count: count)
             row.onRename = { [weak self] id, name in self?.onRenameGroup?(id, name) }
+            row.onDelete = { [weak self] id in self?.onDeleteGroup?(id) }
             groupsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: groupsStack.widthAnchor).isActive = true
         }
@@ -397,6 +400,7 @@ final class PassThroughImageView: NSImageView {
 final class GroupListRow: NSView, NSTextFieldDelegate {
     let groupID: String
     var onRename: ((String, String) -> Void)?
+    var onDelete: ((String) -> Void)?
     private let field: NSTextField
     private var original: String
     private(set) var isEditing = false
@@ -437,11 +441,18 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
             row.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
 
-        // Right-click anywhere on the row (dot, name or count): Rename…
+        // Right-click anywhere on the row (dot, name or count): Rename…, and Delete Group… for
+        // every group but Default (its clips go back to Default).
         let menu = NSMenu()
         let rename = NSMenuItem(title: "Rename…", action: #selector(startRename), keyEquivalent: "")
         rename.target = self
         menu.addItem(rename)
+        if id != VisualGroup.arollID {
+            menu.addItem(.separator())
+            let delete = NSMenuItem(title: "Delete Group…", action: #selector(deleteClicked), keyEquivalent: "")
+            delete.target = self
+            menu.addItem(delete)
+        }
         self.menu = menu
         field.menu = menu
         countLabel.menu = menu
@@ -455,6 +466,8 @@ final class GroupListRow: NSView, NSTextFieldDelegate {
         window.makeFirstResponder(field)
         field.currentEditor()?.selectAll(nil)
     }
+
+    @objc private func deleteClicked() { onDelete?(groupID) }
 
     func controlTextDidBeginEditing(_ obj: Notification) { isEditing = true }
 

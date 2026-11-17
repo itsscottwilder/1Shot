@@ -5,7 +5,7 @@
 import Cocoa
 
 final class TrimBar: NSView {
-    static let height: CGFloat = 210   // 3.2: room for the A1 audio lane under V1
+    static let height: CGFloat = 252   // 3.2: room for the A1 audio lane under V1 (3.3.3: A1 as tall as V1)
 
     // Model (seconds)
     var duration: Double = 0 {
@@ -522,9 +522,9 @@ final class TrimBar: NSView {
         NSRect(x: stripRect.minX, y: audioLaneRect.maxY + 6, width: stripRect.width, height: 5)
     }
 
-    /// A1: the audio waveform, under V1 on every tab (2026-11-11).
+    /// A1: the audio waveform, under V1 on every tab (2026-11-11). As tall as V1 (3.3.3).
     private var audioLaneRect: NSRect {
-        NSRect(x: stripRect.minX, y: stripRect.maxY + 4, width: stripRect.width, height: 38)
+        NSRect(x: stripRect.minX, y: stripRect.maxY + 4, width: stripRect.width, height: stripRect.height)
     }
 
     private var startHandleRect: NSRect {

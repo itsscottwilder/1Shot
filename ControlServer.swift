@@ -346,7 +346,6 @@ extension PlayerWindowController {
             "adjust_graphics": .graphics, "graphics_style": .graphics
         ]
         if let tab = stepTab[command], player != nil { selectTab(tab) }
-        if command == "set_visual" || command == "get_settings" { activateArollGroup() }
         do {
             switch command {
             case "status":            try mcpStatusCommand(args, done)
@@ -354,6 +353,7 @@ extension PlayerWindowController {
             case "snapshot_frame":    try mcpSnapshot(args, done)
             case "get_settings":      try mcpGetSettings(args, done)
             case "set_visual":        done(.success(try mcpSetVisual(args)))
+            case "list_groups":       done(.success(mcpListGroups()))
             case "set_sound":         done(.success(try mcpSetSound(args)))
             case "set_trim":          done(.success(try mcpSetTrim(args)))
             case "create_transcript": try mcpCreateTranscript(args, done)
@@ -452,6 +452,7 @@ extension PlayerWindowController {
                          "brollNotDownloaded": broll.filter { $0.file == nil }.count] as [String: Any]
             s["playhead"] = MCP.r(trimBar.playhead)
             s["playing"] = (player?.rate ?? 0) != 0
+            s["viewer"] = viewerDiagnostics()
         } else {
             s["clip"] = NSNull()
         }
@@ -586,12 +587,25 @@ extension PlayerWindowController {
                     image["insideCut"] = CutList.cut(containing: t, in: self.cuts) != nil
                     image["zoomScale"] = MCP.r(ZoomList.scale(at: t, in: self.zooms))
                     image["brollShowing"] = self.mcpBrollShowing(at: t)
+                    image["group"] = self.groupName(self.arollGroupID(at: t))
+                    if let shot = self.mcpBrollShot(at: t) {
+                        image["brollGroup"] = self.groupName(shot.visualGroup ?? VisualGroup.brollID)
+                    }
                     images.append(image)
                     next(i + 1)
                 }
             }
         }
         next(0)
+    }
+
+    /// The downloaded B-roll shot on screen at original-clip time `t`, if any.
+    private func mcpBrollShot(at t: Double) -> BrollClip? {
+        let edited = t - CutList.removed(before: t, cuts: cuts)
+        return broll.first { c in
+            let start = c.at - CutList.removed(before: c.at, cuts: cuts)
+            return edited >= start && edited < start + c.length && c.file != nil
+        }
     }
 
     private func mcpBrollShowing(at t: Double) -> Bool {
@@ -631,14 +645,21 @@ extension PlayerWindowController {
 
     private func mcpGetSettings(_ args: [String: Any], _ done: @escaping MCPReply) throws {
         var out: [String: Any] = [:]
-        let visual = exportDrawer.snapshot
-        out["visualDesign"] = [
-            "settings": MCP.json(visual),
-            "stabilizer": ["analyzed": stabilizer.isAnalyzed, "on": stabilizer.enabled,
-                           "zoomPercent": MCP.orNull(stabilizer.zoomPercent.map { MCP.r($0, 1) })] as [String: Any],
+        var visual: [String: Any] = [
+            "projectWide": mcpVisualGlobals(),
+            "activeGroup": groupName(activeVisualGroup),
+            "defaultTarget": groupName(defaultTargetGroupID()),
             "lutLibrary": CubeLUT.libraryFiles().map { $0.lastPathComponent },
-            "howToRead": "Order: stabilize → zoom → white balance (Color = temperature, Tint) → Camera LUT → Creative LUT → Levels and the other sliders. Sliders run −100…+100 (Sharpen and Denoise 0…100), 0 = untouched; they're deliberately gentle (±100 is about half of Core Image's full range). blackPoint/whitePoint are Levels (0…1). 'bypassed' lists sliders switched off (red). colorBypass is a preview-only before/after; export is always graded. fade = 0.5 s fade to black at the end plus 2 s of black."
-        ] as [String: Any]
+            "perGroupSettings": Self.perGroupKeys,
+            "projectWideSettings": Self.projectWideKeys,
+            "howToRead": "Every clip belongs to a Visual Design group, and each group has its own look (groups[].settings): sliders (incl. white balance: Color = temperature, Tint), bypassed, blackPoint/whitePoint (Levels) and the Camera/Creative LUTs. Stabilize, smoothness, maxCrop, fade and colorBypass are project-wide (projectWide), not per group. Order: stabilize → zoom → white balance → Camera LUT → Creative LUT → Levels and the other sliders. Sliders run −100…+100 (Sharpen and Denoise 0…100), 0 = untouched; they're deliberately gentle (±100 is about half of Core Image's full range). blackPoint/whitePoint are 0…1. 'bypassed' lists sliders switched off (red). colorBypass is a preview-only before/after; export is always graded. fade = 0.5 s fade to black at the end plus 2 s of black. activeGroup is the group shown in the Visual Design panel; defaultTarget is the group set_visual changes when you pass no group."
+        ]
+        if let name = args["group"] as? String, !name.trimmingCharacters(in: .whitespaces).isEmpty {
+            visual["group"] = mcpGroupJSON(try groupID(named: name))
+        } else {
+            visual["groups"] = visualGroups.map { mcpGroupJSON($0.id) }
+        }
+        out["visualDesign"] = visual
         let sound = drawer.snapshot
         out["soundDesign"] = [
             "settings": MCP.json(sound),
@@ -715,8 +736,18 @@ extension PlayerWindowController {
 
     private func mcpSetVisual(_ args: [String: Any]) throws -> Any {
         try mcpRequireIdle()
-        var snap = exportDrawer.snapshot
-        let names = snap.sliders.keys.sorted()
+        // Which group: the one named, else the selected clip's (or the one under the playhead).
+        let target: String
+        if let name = args["group"] as? String, !name.trimmingCharacters(in: .whitespaces).isEmpty {
+            target = try groupID(named: name)
+        } else {
+            target = defaultTargetGroupID()
+        }
+
+        // Per-group look. Everything is checked before anything changes.
+        var look = self.look(ofGroup: target)
+        let before = look
+        let names = VisualDesignPanel.rows.map(\.title).sorted()
         func sliderName(_ k: String) throws -> String {
             guard let n = names.first(where: { $0.caseInsensitiveCompare(k) == .orderedSame }) else {
                 throw MCPError("There's no “\(k)” slider. Sliders: \(names.joined(separator: ", ")).")
@@ -728,12 +759,12 @@ extension PlayerWindowController {
                 let n = try sliderName(k)
                 guard let d = MCP.num(value) else { throw MCPError("\(n) needs a number.") }
                 let low = (n == "Sharpen" || n == "Denoise") ? 0.0 : -100.0
-                snap.sliders[n] = min(100, max(low, d.rounded()))
+                look.sliders[n] = min(100, max(low, d.rounded()))
             }
         }
-        if let off = args["bypassed"] as? [String] { snap.bypassed = try off.map(sliderName) }
-        if let b = MCP.num(args["blackPoint"]) { snap.blackPoint = min(0.5, max(0, b)) }
-        if let w = MCP.num(args["whitePoint"]) { snap.whitePoint = min(1, max(0.5, w)) }
+        if let off = args["bypassed"] as? [String] { look.bypassed = try off.map(sliderName) }
+        if let b = MCP.num(args["blackPoint"]) { look.blackPoint = min(0.5, max(0, b)) }
+        if let w = MCP.num(args["whitePoint"]) { look.whitePoint = min(1, max(0.5, w)) }
 
         let library = CubeLUT.libraryFiles().map { $0.lastPathComponent }
         func lut(_ key: String) throws -> String?? {
@@ -746,19 +777,28 @@ extension PlayerWindowController {
             }
             return .some(name)
         }
-        if let camera = try lut("cameraLUT") { snap.cameraLUT = camera }
-        if let creative = try lut("creativeLUT") { snap.creativeLUT = creative }
+        if let camera = try lut("cameraLUT") { look.cameraLUT = camera }
+        if let creative = try lut("creativeLUT") { look.creativeLUT = creative }
+
+        // Project-wide settings (the same for every group).
+        var snap = exportDrawer.snapshot
+        let globalsBefore = snap
         if let x = MCP.num(args["smoothness"]) { snap.smoothness = min(100, max(0, x.rounded())) }
         if let x = MCP.num(args["maxCrop"]) { snap.maxCrop = min(20, max(2, x.rounded())) }
         if let x = args["fade"] as? Bool { snap.fade = x }
         if let x = args["colorBypass"] as? Bool { snap.colorBypass = x }
 
-        let openProject = self.project
-        exportDrawer.restore(snap) { name in
-            if let inLibrary = CubeLUT.libraryFiles().first(where: { $0.lastPathComponent == name }) { return inLibrary }
-            guard let kept = openProject?.lutCopy(named: name) else { return nil }
-            return try? CubeLUT.importToLibrary(kept)
+        // Project-wide first (restore re-applies the panel's own look), then the group's look.
+        if snap != globalsBefore {
+            let openProject = self.project
+            exportDrawer.restore(snap) { name in
+                if let inLibrary = CubeLUT.libraryFiles().first(where: { $0.lastPathComponent == name }) { return inLibrary }
+                guard let kept = openProject?.lutCopy(named: name) else { return nil }
+                return try? CubeLUT.importToLibrary(kept)
+            }
         }
+        if look != before { setLook(look, ofGroup: target) }
+
         var note: String?
         if let on = args["stabilize"] as? Bool {
             if on && !stabilizer.isAnalyzed {
@@ -772,10 +812,73 @@ extension PlayerWindowController {
             }
         }
         saveProject()
-        var out: [String: Any] = ["visualDesign": MCP.json(exportDrawer.snapshot),
-                                  "stabilizer": ["analyzed": stabilizer.isAnalyzed, "on": stabilizer.enabled]]
+        var out: [String: Any] = [
+            "group": groupName(target),
+            "groupChanged": look != before,
+            "settings": MCP.json(self.look(ofGroup: target)),
+            "clips": timelineClips(inGroup: target).aroll,
+            "projectWide": mcpVisualGlobals(),
+            "panelShows": groupName(activeVisualGroup)
+        ]
         if let note { out["note"] = note }
         return out
+    }
+
+    // MARK: list_groups
+
+    private func mcpListGroups() -> Any {
+        [
+            "groups": visualGroups.map { g -> [String: Any] in
+                let (a, b) = timelineClips(inGroup: g.id)
+                return ["name": g.name, "color": Self.hex(g.color), "isDefault": g.id == VisualGroup.arollID,
+                        "isBrollGroup": g.id == VisualGroup.brollID, "clips": a, "brollShots": b,
+                        "assets": assetFiles(inGroup: g.id), "summary": Self.lookSummary(look(ofGroup: g.id))]
+            },
+            "activeGroup": groupName(activeVisualGroup),
+            "defaultTarget": groupName(defaultTargetGroupID()),
+            "projectWide": mcpVisualGlobals(),
+            "note": "clips are the A-roll clips on V1 (index from 1, start/end in timeline seconds). assets are the imported clips in the group, on the timeline or not. New A-roll clips start in the Default group; B-roll shots start in the B-roll group."
+        ] as [String: Any]
+    }
+
+    /// One group, for get_settings.
+    private func mcpGroupJSON(_ id: String) -> [String: Any] {
+        let g = visualGroups.first(where: { $0.id == id })
+        let (a, b) = timelineClips(inGroup: id)
+        return ["name": g?.name ?? id, "color": g.map { Self.hex($0.color) } ?? NSNull(),
+                "isDefault": id == VisualGroup.arollID, "isBrollGroup": id == VisualGroup.brollID,
+                "clips": a, "brollShots": b, "assets": assetFiles(inGroup: id),
+                "settings": MCP.json(look(ofGroup: id))]
+    }
+
+    /// Stabilize, Fade and the preview before/after: one setting for the whole project.
+    private func mcpVisualGlobals() -> [String: Any] {
+        let snap = exportDrawer.snapshot
+        return ["stabilize": ["analyzed": stabilizer.isAnalyzed, "on": stabilizer.enabled,
+                              "smoothness": snap.smoothness, "maxCrop": snap.maxCrop,
+                              "zoomPercent": MCP.orNull(stabilizer.zoomPercent.map { MCP.r($0, 1) })] as [String: Any],
+                "fade": snap.fade, "colorBypass": snap.colorBypass]
+    }
+
+    static let perGroupKeys = ["sliders", "bypassed", "blackPoint", "whitePoint", "cameraLUT", "creativeLUT"]
+    static let projectWideKeys = ["stabilize", "smoothness", "maxCrop", "fade", "colorBypass"]
+
+    static func hex(_ c: NSColor) -> String {
+        guard let s = c.usingColorSpace(.sRGB) else { return "#000000" }
+        return String(format: "#%02X%02X%02X", Int((s.redComponent * 255).rounded()),
+                      Int((s.greenComponent * 255).rounded()), Int((s.blueComponent * 255).rounded()))
+    }
+
+    /// "Sharpen 10, Exposure −5 · Camera LUT x.cube" — or "neutral".
+    static func lookSummary(_ l: VisualDesignPanel.Look) -> String {
+        var parts = l.sliders.filter { $0.value != 0 }.sorted { $0.key < $1.key }
+            .map { "\($0.key) \(Int($0.value))\(l.bypassed.contains($0.key) ? " (off)" : "")" }
+        if l.blackPoint != 0 || l.whitePoint != 1 {
+            parts.append(String(format: "Levels %.2f–%.2f", l.blackPoint, l.whitePoint))
+        }
+        if let c = l.cameraLUT { parts.append("Camera LUT \(c)") }
+        if let c = l.creativeLUT { parts.append("Creative LUT \(c)") }
+        return parts.isEmpty ? "neutral" : parts.joined(separator: ", ")
     }
 
     // MARK: set_sound

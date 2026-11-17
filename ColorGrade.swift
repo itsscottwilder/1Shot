@@ -29,6 +29,17 @@ final class ColorGrade {
     private let lock = NSLock()
     private var _settings = Settings()
     private var _framesGraded = 0
+    private var _emptySourceFrames = 0
+    private var _lastSourceExtent = CGRect.null
+    /// For the viewer diagnostics in `status`: frames graded, frames whose source came in empty, last source extent.
+    var frameStats: (graded: Int, emptySource: Int, lastExtent: CGRect) {
+        lock.lock(); defer { lock.unlock() }
+        return (_framesGraded, _emptySourceFrames, _lastSourceExtent)
+    }
+    private func noteSource(_ e: CGRect, bad: Bool) {
+        lock.lock(); _lastSourceExtent = e; if bad { _emptySourceFrames += 1 }; let n = _emptySourceFrames; lock.unlock()
+        if bad && (n == 1 || n % 100 == 0) { NSLog("1Shot: compositor got an empty source frame (#\(n), extent \(e))") }
+    }
     private var _lut: CubeLUT?
     private var _creativeLUT: CubeLUT?
 
@@ -175,14 +186,13 @@ final class ColorGrade {
             // The frame's real size (3.3.2). Now and then AVFoundation hands over a source image with
             // an infinite or empty extent (seen while dragging plates on an A-roll of HEVC clips);
             // drawing B-roll and graphics into that crashed the app (Int(extent.width) trapped).
-            let frame: CGRect = {
+            let sourceBad: Bool = {
                 let e = source.extent
-                if e.isInfinite || e.isNull || e.isEmpty || !e.width.isFinite || !e.height.isFinite
-                    || e.width > 32_768 || e.height > 32_768 {
-                    return CGRect(origin: .zero, size: request.renderSize)
-                }
-                return e
+                return e.isInfinite || e.isNull || e.isEmpty || !e.width.isFinite || !e.height.isFinite
+                    || e.width > 32_768 || e.height > 32_768
             }()
+            let frame = sourceBad ? CGRect(origin: .zero, size: request.renderSize) : source.extent
+            self?.noteSource(source.extent, bad: sourceBad)
             guard let self else { request.finish(with: source, context: nil); return }
             // Time on the original clip (differs from the player's time when cuts are taken out).
             let clipTime = mapTime.map { CMTime(seconds: $0(request.compositionTime.seconds), preferredTimescale: 60_000) }

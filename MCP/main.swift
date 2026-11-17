@@ -10,7 +10,7 @@
 
 import Foundation
 
-let serverVersion = "2.7.0"
+let serverVersion = "2.8.0"
 let bundleID = "com.itsscottwilder.timecodeplayer"
 let supportPath = NSHomeDirectory() + "/Library/Application Support/1Shot"
 let socketPath = supportPath + "/mcp.sock"
@@ -166,7 +166,7 @@ let tool_open_project: [String: Any] = [
 
 let tool_snapshot_frame: [String: Any] = [
     "name": "snapshot_frame",
-    "description": "A picture of the video at a moment, as the export will look (graded: stabilization, zoom, LUTs, color and B-roll), or as recorded (graded: false). Use it to see the shot, judge the user's Visual Design choices, check a zoom or a B-roll spot.",
+    "description": "A picture of the video at a moment, as the export will look (graded: stabilization, zoom, LUTs, color and B-roll), or as recorded (graded: false). Use it to see the shot, judge the user's Visual Design choices, check a zoom or a B-roll spot. Each image says which Visual Design group grades it (group; brollGroup too when a B-roll shot is on screen), so you can check a group's look landed on the right clip.",
     "inputSchema": ["type": "object", "properties": [
         "at": prop("number", "Seconds on the original clip. Default: the playhead."),
         "times": ["type": "array", "items": ["type": "number"], "description": "Up to 6 times for several frames at once."],
@@ -178,8 +178,9 @@ let tool_snapshot_frame: [String: Any] = [
 
 let tool_get_settings: [String: Any] = [
     "name": "get_settings",
-    "description": "Every Visual Design setting (white balance, LUTs, Levels, sliders, stabilize, fade) and Sound Design setting (voice isolation, high pass, gate, compressor, de-esser, limiter) in raw and plain units, plus the live output meter. Also the live Loudness (LUFS) meters. measure: true also measures the original recording inside the trim (integrated LUFS, peak, noise floor, speech level) and the whole edit after Sound Design, exactly as it will export (target −14 LUFS; the export can normalize to it). Pipeline steps 1–2 are the user's for now: read their settings, explain what you think each choice is for, say which you can't explain, and stop for their approval.",
+    "description": "Every Visual Design setting and Sound Design setting. Visual Design is per group: every clip belongs to a Visual Design group (Default, B-roll and any the user made), and each group has its own look (sliders incl. white balance, bypassed, Levels, Camera/Creative LUT). With no group: visualDesign.groups lists every group with its clips and settings, plus activeGroup (shown in the panel) and defaultTarget (what set_visual changes when you pass no group). With group: just that group. Stabilize, smoothness, maxCrop, fade and colorBypass are project-wide (visualDesign.projectWide). Sound Design: (voice isolation, high pass, gate, compressor, de-esser, limiter) in raw and plain units, plus the live output meter. Also the live Loudness (LUFS) meters. measure: true also measures the original recording inside the trim (integrated LUFS, peak, noise floor, speech level) and the whole edit after Sound Design, exactly as it will export (target −14 LUFS; the export can normalize to it). Pipeline steps 1–2 are the user's for now: read their settings, explain what you think each choice is for, say which you can't explain, and stop for their approval.",
     "inputSchema": ["type": "object", "properties": [
+        "group": prop("string", "A Visual Design group's name (e.g. \"Default\"): return only that group. Leave out for every group."),
         "measure": prop("boolean", "Also measure the loudness of the original recording and of the whole edit after Sound Design (pauses playback; a few seconds to a minute).")
     ]],
     "annotations": ["readOnlyHint": true]
@@ -187,8 +188,9 @@ let tool_get_settings: [String: Any] = [
 
 let tool_set_visual: [String: Any] = [
     "name": "set_visual",
-    "description": "Changes Visual Design settings. Only what you pass changes. The user does Visual Design themself for now: use this only when they ask.",
+    "description": "Changes Visual Design settings. Only what you pass changes. Per-group settings (sliders, bypassed, blackPoint, whitePoint, cameraLUT, creativeLUT) go to ONE Visual Design group: the one you name in group, else the group of the clip selected in the app (or under the playhead). Project-wide settings (stabilize, smoothness, maxCrop, fade, colorBypass) apply to the whole video whatever group you name. It never changes the app's clip selection. The answer says which group changed. Use list_groups or get_settings to see the groups. The user does Visual Design themself for now: use this only when they ask.",
     "inputSchema": ["type": "object", "properties": [
+        "group": prop("string", "The Visual Design group to change, by name (e.g. \"Default\", \"Show and tell\"). Leave out for the selected clip's group."),
         "sliders": ["type": "object", "description": "By name: Exposure, Saturation, Vibrance, Color, Tint, Highlights, Shadows (−100…100), Sharpen, Denoise (0…100). Example {\"Color\": 12, \"Tint\": -4}.",
                     "additionalProperties": ["type": "number"]],
         "bypassed": ["type": "array", "items": ["type": "string"], "description": "Slider names to switch off (shown red). Replaces the current list."],
@@ -196,12 +198,19 @@ let tool_set_visual: [String: Any] = [
         "whitePoint": prop("number", "Levels white point, 0.5–1."),
         "cameraLUT": prop(["string", "null"], "A LUT file name from get_settings' lutLibrary, or null for none."),
         "creativeLUT": prop(["string", "null"], "A LUT file name, or null for none."),
-        "stabilize": prop("boolean", "Turn stabilization on (analyzes the clip first if needed) or off."),
-        "smoothness": prop("number", "Stabilization smoothness 0–100 (100 = locked off like a tripod)."),
-        "maxCrop": prop("number", "Stabilization max crop, 2–20 %."),
-        "fade": prop("boolean", "Fade to black at the end (+2 s of black)."),
-        "colorBypass": prop("boolean", "Preview-only before/after switch for the Color section.")
+        "stabilize": prop("boolean", "Project-wide: turn stabilization on (analyzes the clip first if needed) or off."),
+        "smoothness": prop("number", "Project-wide: stabilization smoothness 0–100 (100 = locked off like a tripod)."),
+        "maxCrop": prop("number", "Project-wide: stabilization max crop, 2–20 %."),
+        "fade": prop("boolean", "Project-wide: fade to black at the end (+2 s of black)."),
+        "colorBypass": prop("boolean", "Project-wide, preview only: before/after switch for the Color section.")
     ]]
+]
+
+let tool_list_groups: [String: Any] = [
+    "name": "list_groups",
+    "description": "The Visual Design groups: each group's name, colour, A-roll clips (index on V1 from 1, file, start/end in timeline seconds), B-roll shots, imported clips, and a one-line summary of its look. Also activeGroup (shown in the panel), defaultTarget (what set_visual changes with no group) and the project-wide settings. Use a group's name in set_visual and get_settings.",
+    "inputSchema": ["type": "object", "properties": [String: Any]()],
+    "annotations": ["readOnlyHint": true]
 ]
 
 let tool_set_sound: [String: Any] = [
@@ -421,6 +430,7 @@ let tools: [[String: Any]] = [
     tool_snapshot_frame,
     tool_get_settings,
     tool_set_visual,
+    tool_list_groups,
     tool_set_sound,
     tool_set_trim,
     tool_create_transcript,
@@ -444,7 +454,7 @@ let instructions = """
 
 Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after every step. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.
-1 Visual Design: The user does this themself for now. Use get_settings and snapshot_frame to read their choices, explain what you think each is for, and say plainly which you can't explain. Use set_visual only if they ask.
+1 Visual Design: The user does this themself for now. Each clip belongs to a Visual Design group with its own look; list_groups shows them. Use get_settings and snapshot_frame to read their choices group by group, explain what you think each is for, and say plainly which you can't explain. Use set_visual only if they ask.
 2 Sound Design: The user does this themself for now. Use get_settings with measure: true and explain the same way, including how far the edit is from YouTube's −14 LUFS. You can't listen, so their ears are the final say. Use set_sound only if they ask.
 3 Start and stop points: create_transcript, read_transcript, then set_trim. Show in/out with the first and last words.
 4 Ums, ahs and long silences: apply_cuts (mode replace) per the "Default - Talking Head" style guide. Show the count, seconds removed and a few examples. Filler words are often missing from the transcript, so expect the user to check this step.

@@ -109,6 +109,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     let assetsPanel = AssetsPanel()
     /// The DaVinci-style step tabs (3.0.0) and the permanent right-side panel they switch between.
     let tabBar = WorkspaceTabBar()
+    /// Play/pause, frame steps, go to start/end and loop, above the step tabs (3.3.3).
+    let transportBar = TransportBar()
+    private var transportObservation: NSKeyValueObservation?
     let rightPanel = RightPanel()
     // 3.2: list panels for the Cuts, Zooms, B-roll and Graphics tabs (see TimelinePanels.swift).
     let cutsPanel = TimelineListPanel(title: "Cuts", subtitle: "Every piece cut out, in order. Type an In or Out time (MM:SS:FF) and press Return to move that edge to the frame.", thumbnails: false)
@@ -246,6 +249,15 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         tabBar.isHidden = true
         tabBar.onSelect = { [weak self] tab in self?.selectTab(tab) }
         container.addSubview(tabBar)
+        transportBar.onGoToStart = { [weak self] in self?.goToStart() }
+        transportBar.onStepBack = { [weak self] in self?.stepFrame(by: -1) }
+        transportBar.onPlayPause = { [weak self] in self?.togglePlayPause() }
+        transportBar.onStepForward = { [weak self] in self?.stepFrame(by: 1) }
+        transportBar.onGoToEnd = { [weak self] in self?.goToEnd() }
+        transportBar.onToggleLoop = { [weak self] in self?.toggleLoop() }
+        transportBar.setLoop(loopPlayback)
+        transportBar.setEnabled(false)
+        container.addSubview(transportBar)
 
         // Assets tab (3.1.0): import/review/reject/trim source clips, then build the A-roll.
         assetsPanel.onImport = { [weak self] urls in self?.importAssets(urls) }
@@ -256,6 +268,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         assetsPanel.onMoveToNewGroup = { [weak self] ids in self?.moveAssetsToNewGroup(ids) }
         assetsPanel.onMoveToGroup = { [weak self] ids, group in self?.moveAssets(ids, toGroup: group) }
         assetsPanel.onRenameGroup = { [weak self] id, name in self?.renameGroup(id, to: name) }
+        assetsPanel.onDeleteGroup = { [weak self] id in self?.confirmDeleteGroup(id) }
         assetsPanel.trimPanel.onSetIn = { [weak self] seconds in self?.setTrimFromPanel(start: seconds, end: nil) }
         assetsPanel.trimPanel.onSetOut = { [weak self] seconds in self?.setTrimFromPanel(start: nil, end: seconds) }
         assetsPanel.trimPanel.onSetInAtPlayhead = { [weak self] in
@@ -330,7 +343,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         // populated, not just once a clip is loaded. Only the DropView hint (behind the hidden
         // playerView) needs an actual clip.
         let open = project != nil
-        let barHeight = open ? TrimBar.height + WorkspaceTabBar.height : 0
+        let barHeight = open ? TrimBar.height + WorkspaceTabBar.height + TransportBar.height : 0
         let b = container.bounds
         let pw = RightPanel.width
 
@@ -339,10 +352,13 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         }
         trimBar.isHidden = !open
         tabBar.isHidden = !open
+        transportBar.isHidden = !open
         rightPanel.isHidden = !open
         let videoWidth = b.width - pw
         place(trimBar, NSRect(x: 0, y: 0, width: videoWidth, height: TrimBar.height))
         place(tabBar, NSRect(x: 0, y: TrimBar.height, width: videoWidth, height: WorkspaceTabBar.height))
+        place(transportBar, NSRect(x: 0, y: TrimBar.height + WorkspaceTabBar.height,
+                                   width: videoWidth, height: TransportBar.height))
         place(playerView, NSRect(x: 0, y: barHeight, width: videoWidth, height: b.height - barHeight))
         eyedropperView.frame = playerView.frame
         place(rightPanel, NSRect(x: videoWidth, y: 0, width: pw, height: b.height))
@@ -383,9 +399,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         arollRecipe = nil
         selectedAssetID = assetID
         trimBar.showFullAsset = (currentTab == .assets && assetID != nil)
-        if let obs = timeObserver { player?.removeTimeObserver(obs) }
-        timeObserver = nil
-        player?.pause()
+        releasePlayer()
         preparePlayer(AVURLAsset(url: url))
     }
 
@@ -395,10 +409,68 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         currentVideo = nil
         selectedAssetID = nil
         trimBar.showFullAsset = false
+        releasePlayer()
+        preparePlayer(composition)
+    }
+
+    /// Lets go of the current player completely before another clip loads (3.3.3). A paused
+    /// AVPlayer still holds its item, its 4K HEVC decoder and the view's display layer; handing the
+    /// view a new player while the old one held all that could leave the viewer black (timecode
+    /// only, and no sound, since the effects rack follows the player) for the new clip.
+    private func releasePlayer() {
+        viewerWatchdog?.cancel(); viewerWatchdog = nil
         if let obs = timeObserver { player?.removeTimeObserver(obs) }
         timeObserver = nil
-        player?.pause()
-        preparePlayer(composition)
+        transportObservation = nil
+        transportBar.setPlaying(false)
+        transportBar.setEnabled(false)
+        guard let old = player else { return }
+        old.pause()
+        rack.detach()
+        playerView.player = nil
+        old.replaceCurrentItem(with: nil)
+        videoOutput = nil
+        player = nil
+    }
+
+    private var viewerWatchdog: Task<Void, Never>?
+
+    /// Makes sure the viewer actually shows a frame once the item can play (3.3.3). Now and then
+    /// (large 4K HEVC clips, right after switching clips) the item is ready and the color stage
+    /// renders frames, yet AVPlayerView never becomes ready for display and stays black. When that
+    /// happens, hand the view its player again and re-seek exactly to force a fresh frame.
+    func ensureViewerShowsFrame(_ p: AVPlayer) {
+        viewerWatchdog?.cancel()
+        viewerWatchdog = Task { @MainActor [weak self] in
+            var attempts = 0
+            var waited = 0.0
+            while !Task.isCancelled, waited < 20 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                waited += 0.25
+                guard let self, self.player === p, let item = p.currentItem else { return }
+                if item.status == .failed {
+                    NSLog("1Shot: viewer: the clip failed to load: \(item.error?.localizedDescription ?? "unknown error"); log: \(item.errorLog()?.events.map { "\($0.errorStatusCode) \($0.errorComment ?? "")" } ?? [])")
+                    return
+                }
+                guard item.status == .readyToPlay else { continue }
+                if self.playerView.isReadyForDisplay {
+                    if waited > 0.5 { NSLog("1Shot: viewer: first frame on screen after \(waited) s") }
+                    return
+                }
+                // Give a heavy clip a moment to show its first frame before stepping in.
+                guard waited >= Double(attempts + 1) * 1.0 else { continue }
+                attempts += 1
+                NSLog("1Shot: viewer: ready to play but nothing on screen after \(waited) s; re-attaching (try \(attempts))")
+                self.playerView.player = nil
+                self.playerView.player = p
+                let t = p.currentTime()
+                await p.seek(to: t.isNumeric ? t : .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+                if attempts >= 3 {
+                    NSLog("1Shot: viewer: still not showing a frame after \(attempts) tries")
+                    return
+                }
+            }
+        }
     }
 
     /// Find the audio track first so the effects hookup is in place BEFORE the player starts —
@@ -459,6 +531,12 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
         player = p
         playerView.player = p
+        ensureViewerShowsFrame(p)
+        transportBar.setEnabled(true)
+        transportObservation = p.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] p, _ in
+            let on = p.timeControlStatus != .paused
+            DispatchQueue.main.async { self?.transportBar.setPlaying(on) }
+        }
         watchPlaybackEnds(of: p, item: item)
         playerView.isHidden = false
         container.showsHint = false
@@ -515,7 +593,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: End of video / loop
 
-    private(set) var loopPlayback = true
+    private(set) var loopPlayback = UserDefaults.standard.object(forKey: "LoopPlayback") as? Bool ?? true
     private var playbackPauseGeneration = 0
     private var endObserver: NSObjectProtocol?
     private let tailCover = NSView()
@@ -533,6 +611,33 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     func toggleLoop() {
         loopPlayback.toggle()
         UserDefaults.standard.set(loopPlayback, forKey: "LoopPlayback")
+        transportBar.setLoop(loopPlayback)
+    }
+
+    /// What the viewer is doing, for `status` (MCP) — so a black viewer can be diagnosed without eyes on it.
+    func viewerDiagnostics() -> [String: Any] {
+        var d: [String: Any] = [:]
+        let item = player?.currentItem
+        d["itemStatus"] = ["unknown", "readyToPlay", "failed"][item?.status.rawValue ?? 0]
+        d["itemError"] = MCP.orNull(item?.error?.localizedDescription)
+        d["errorLog"] = item?.errorLog()?.events.suffix(3).map { "\($0.errorDomain) \($0.errorStatusCode) \($0.errorComment ?? "")" } ?? []
+        d["timeControl"] = ["paused", "waiting", "playing"][player?.timeControlStatus.rawValue ?? 0]
+        d["waitingReason"] = MCP.orNull(player?.reasonForWaitingToPlay?.rawValue)
+        d["playerTime"] = MCP.r(player?.currentTime().seconds ?? -1)
+        d["readyForDisplay"] = playerView.isReadyForDisplay
+        d["viewHidden"] = playerView.isHidden
+        d["viewHasPlayer"] = playerView.player === player && player != nil
+        d["viewFrame"] = "\(Int(playerView.frame.width))x\(Int(playerView.frame.height))"
+        let stats = grade.frameStats
+        d["framesGraded"] = stats.graded
+        d["emptySourceFrames"] = stats.emptySource
+        d["lastSourceExtent"] = "\(stats.lastExtent)"
+        if let out = videoOutput, let item {
+            let t = out.itemTime(forHostTime: CACurrentMediaTime())
+            d["outputHasFrame"] = out.hasNewPixelBuffer(forItemTime: t)
+            d["outputAttached"] = item.outputs.contains { $0 === out }
+        }
+        return d
     }
 
     private func watchPlaybackEnds(of p: AVPlayer, item: AVPlayerItem) {
@@ -897,6 +1002,24 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// Transport › Go to start: the trim start (the clip's start when untrimmed). Keeps playing if it was.
+    func goToStart() {
+        guard !isExporting, let p = player else { return }
+        hideTail()
+        let start = trimRange?.start ?? 0
+        p.seek(to: CMTime(seconds: toComp(start), preferredTimescale: 600),
+               toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// Transport › Go to end: the last frame before the trim end (pauses first).
+    func goToEnd() {
+        guard !isExporting, let p = player else { return }
+        playbackPauseGeneration += 1
+        p.pause()
+        let end = trimRange?.end ?? trimBar.duration
+        seekExactly(p, to: toComp(end) - 1 / max(1, TrimBar.frameRate))
+    }
+
     /// Jump one second back or forward (pauses first).
     func stepSecond(by direction: Int) {
         guard !isExporting, let p = player else { return }
@@ -1015,7 +1138,10 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Projects
 
-    var project: Project?
+    var project: Project? {
+        // The project picker shows only while no project is open (3.3.3).
+        didSet { DispatchQueue.main.async { (NSApp.delegate as? AppDelegate)?.updateProjectPicker() } }
+    }
     private(set) var currentVideo: URL?
     var pendingRestore: ProjectData?     // settings waiting for the clip to finish loading
     private var autosaveTimer: Timer?
@@ -1512,6 +1638,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             self.videoOutput = output
             p.pause()
             p.replaceCurrentItem(with: item)
+            self.ensureViewerShowsFrame(p)
             self.rack.attach(to: p, item: item, asset: playAsset, track: audioTrack, sampleRate: self.sourceSampleRate)
             self.watchPlaybackEnds(of: p, item: item)
             if let trim { self.applyTrim(start: trim.start, end: trim.end, to: item, duration: duration) }
@@ -1653,7 +1780,10 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         setZooms(list)
     }
 
+    /// A zoom added by hand on the timeline. A punch-in gets its own reset 15 s later (see
+    /// insertPunchIn); a scale of 1 is just a reset.
     func addZoom(at t: Double, scale: Double) {
+        if scale > 1.001 { insertPunchIn(at: t, scale: scale); return }
         setZooms(zooms + [ZoomEvent(at: t, scale: scale, type: ZoomList.type(for: scale), reason: "manual", words: nil)])
     }
 
@@ -1937,17 +2067,24 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         return (got, problems)
     }
 
-    /// Z key: a punch-in at the playhead that goes back to normal 10 s later (or just before the
-    /// next zoom). Drag either marker to adjust the in and out points.
+    /// Z key: a punch-in at the playhead.
     func insertZoomAtPlayhead() {
         guard player != nil, trimBar.duration > 0 else { NSSound.beep(); return }
+        insertPunchIn(at: trimBar.playhead, scale: ZoomList.punchScale)
+    }
+
+    /// A punch-in added by hand that goes back to normal 15 s later (ZoomList.defaultHold), or just
+    /// before the next zoom or the trim end, whichever comes first. Drag either marker (or edit In/Out
+    /// in the Zooms tab) to adjust it.
+    func insertPunchIn(at time: Double, scale: Double) {
+        guard trimBar.duration > 0 else { NSSound.beep(); return }
         let fps = max(1, TrimBar.frameRate)
-        let t = (trimBar.playhead * fps).rounded() / fps
+        let t = (time * fps).rounded() / fps
         let limit = trimRange?.end ?? trimBar.duration
         var out = min(t + ZoomList.defaultHold, limit)
         if let next = zooms.first(where: { $0.at > t + 0.05 }) { out = min(out, next.at - 0.1) }
         var list = zooms.filter { abs($0.at - t) > 0.05 }
-        list.append(ZoomEvent(at: t, scale: ZoomList.punchScale, type: "punch-in", reason: "manual", words: nil))
+        list.append(ZoomEvent(at: t, scale: scale, type: ZoomList.type(for: scale), reason: "manual", words: nil))
         if out > t + 0.5 {
             list.append(ZoomEvent(at: (out * fps).rounded() / fps, scale: 1, type: "reset", reason: "manual", words: nil))
         }
@@ -2757,9 +2894,11 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         timeObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+        viewerWatchdog?.cancel(); viewerWatchdog = nil
         player?.pause()
         rack.detach()
         playerView.player = nil
+        player?.replaceCurrentItem(with: nil)
         player = nil
     }
 }
@@ -3014,6 +3153,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private let recentMenu = NSMenu(title: "Open Recent")
     private var projectSelector: ProjectSelector?
 
+    /// The project picker shows only while no project is open (3.3.3): any project window on
+    /// screen (or in the Dock) hides it; closing the last one brings it back.
+    func updateProjectPicker() {
+        guard runningCopy == nil else { return }
+        let anyOpen = controllers.contains { c in
+            guard c.project != nil, let w = c.window else { return false }
+            return w.isVisible || w.isMiniaturized
+        }
+        if anyOpen {
+            projectSelector?.window?.orderOut(nil)
+        } else if projectSelector?.window?.isVisible != true {
+            showProjectSelector()
+        }
+    }
+
     private func showProjectSelector() {
         let selector = projectSelector ?? ProjectSelector()
         projectSelector = selector
@@ -3241,6 +3395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// A project window was closed. The last one stays around hidden (the Dock icon brings it
     /// back, as before); any other is let go, so its project stops using memory and audio.
     func projectWindowClosed(_ c: PlayerWindowController) {
+        DispatchQueue.main.async { [weak self] in self?.updateProjectPicker() }   // once it's off screen
         guard controllers.count > 1 else { return }
         controllers.removeAll { $0 === c }
         c.tearDown()
@@ -3252,6 +3407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         guard let c = (note.object as? NSWindow)?.windowController as? PlayerWindowController else { return }
         lastActive = c
         for other in controllers where other !== c { other.player?.pause() }
+        if c.project != nil { projectSelector?.window?.orderOut(nil) }
     }
 
     private var pendingURL: URL?
@@ -3260,6 +3416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// Space bar = play/pause from any of this app's windows (player, plugin editors…),
     /// except while you're typing into a text field.
     /// Left/right arrow = step one frame back/forward (Shift = one second). Hold to keep stepping.
+    /// Home / End (fn ← / fn →) = go to the start / end of the trim.
     /// A / S / V = switch to the Assets, Sound Design and Visual Design tabs. E = Export for YouTube.
     /// X = mark a cut (press at the start, then at the end) · Delete = remove the selected cut · Esc = cancel marking.
     private func installSpaceBarMonitor() {
@@ -3278,6 +3435,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 return nil
             case 53:         // esc: stop marking a cut
                 return self.controller?.cancelMarkCut() == true ? nil : event
+            case 115, 119:   // Home, End (fn ← / fn → on a laptop): go to start / end
+                guard mods.isEmpty, self.spaceShouldControlPlayback(event),
+                      let controller = self.controller else { return event }
+                if event.keyCode == 115 { controller.goToStart() } else { controller.goToEnd() }
+                return nil
             case 123, 124:   // left, right arrow
                 guard mods.isEmpty || mods == .shift, self.spaceShouldControlPlayback(event),
                       !((event.window ?? NSApp.keyWindow)?.firstResponder is NSSlider),
@@ -3401,7 +3563,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     /// Clicking the Dock icon with no window open brings the window back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { showMainWindow(nil) }
+        // Nothing on screen: a closed project window counts as closed, so this shows the project
+        // picker (3.3.3; ⌘1 still brings the last project window back). A window in the Dock
+        // comes back the usual way.
+        if !flag { updateProjectPicker() }
         return true
     }
 

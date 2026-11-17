@@ -256,6 +256,61 @@ extension PlayerWindowController {
         saveProject()
     }
 
+    /// Assets tab › right-click a group › Delete Group… Asks first (the group's look goes with it).
+    func confirmDeleteGroup(_ id: String) {
+        guard id != VisualGroup.arollID, id != VisualGroup.brollID,
+              let g = visualGroups.first(where: { $0.id == id }) else { return }
+        let clips = assets.filter { $0.visualGroup == id }.count
+        let shots = broll.filter { $0.visualGroup == id }.count
+        guard let window else { deleteGroup(id); return }
+        let alert = NSAlert()
+        alert.messageText = "Delete the “\(g.name)” group?"
+        var info = "Its Visual Design look is deleted with it."
+        if clips > 0 {
+            let def = visualGroups.first(where: { $0.id == VisualGroup.arollID })?.name ?? "Default"
+            info += clips == 1 ? " Its clip moves to “\(def)”." : " Its \(clips) clips move to “\(def)”."
+        }
+        if shots > 0 {
+            let b = visualGroups.first(where: { $0.id == VisualGroup.brollID })?.name ?? "B-roll"
+            info += shots == 1 ? " Its B-roll shot moves to “\(b)”." : " Its \(shots) B-roll shots move to “\(b)”."
+        }
+        alert.informativeText = info
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.deleteGroup(id)
+        }
+    }
+
+    /// Removes a group (never Default or B-roll). Its A-roll clips go back to Default, its B-roll
+    /// shots back to the B-roll group (both stored as nil).
+    func deleteGroup(_ id: String) {
+        guard id != VisualGroup.arollID, id != VisualGroup.brollID,
+              visualGroups.contains(where: { $0.id == id }) else { return }
+        for k in assets.indices where assets[k].visualGroup == id { assets[k].visualGroup = nil }
+        if broll.contains(where: { $0.visualGroup == id }) {
+            var list = broll
+            for k in list.indices where list[k].visualGroup == id { list[k].visualGroup = nil }
+            setBroll(list)
+        }
+        visualGroups.removeAll { $0.id == id }
+        assetsPanel.setAssets(assets, selectedID: selectedAssetID)
+        syncVisualGroups()
+        if let clip = selectedVisualClip {
+            selectVisualClip(clip)                  // loads the clip's new group into the panel
+        } else if activeVisualGroup == id {
+            activeVisualGroup = VisualGroup.arollID
+            let look = visualGroups.first(where: { $0.id == VisualGroup.arollID })?.look ?? VisualDesignPanel.Look()
+            exportDrawer.applyLook(look) { [weak self] name in self?.lutURL(named: name) }
+            updateGroupHeader(clip: "")
+        } else {
+            updateGroupHeader(clip: "")
+        }
+        saveProject()
+    }
+
     func renameActiveGroup() {
         guard let i = visualGroups.firstIndex(where: { $0.id == activeVisualGroup }), let window else { return }
         let alert = NSAlert()
@@ -322,5 +377,101 @@ extension PlayerWindowController {
         syncVisualGroups()
         if let clip = selectedVisualClip { selectVisualClip(clip) }
         saveProject()
+    }
+}
+
+
+// MARK: Groups by name, for the MCP tools (3.3.3)
+// set_visual / get_settings / list_groups / snapshot_frame read and write any group's look
+// directly, without touching what the panel shows or which clip is selected.
+
+extension PlayerWindowController {
+
+    /// The group a call works on when it names none: the selected clip's group (what the Visual
+    /// Design panel shows), else the A-roll clip's under the playhead.
+    func defaultTargetGroupID() -> String {
+        if let clip = selectedVisualClip { return groupAndLabel(for: clip).0 }
+        return arollGroupID(at: trimBar.playhead)
+    }
+
+    /// The group that grades the A-roll (V1) at original-clip time `t`.
+    func arollGroupID(at t: Double) -> String {
+        let clips = arollClips()
+        let i = trimBar.sourceClipBoundaries.filter { t >= $0 }.count
+        guard clips.indices.contains(i) else { return VisualGroup.arollID }
+        return clips[i].visualGroup ?? VisualGroup.arollID
+    }
+
+    func groupName(_ id: String) -> String {
+        visualGroups.first(where: { $0.id == id })?.name ?? id
+    }
+
+    /// A group by its name (any case) or id; the error lists the names there are.
+    func groupID(named name: String) throws -> String {
+        let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let g = visualGroups.first(where: { $0.name.caseInsensitiveCompare(wanted) == .orderedSame })
+            ?? visualGroups.first(where: { $0.id == wanted }) {
+            return g.id
+        }
+        let names = visualGroups.map { "“\($0.name)”" }.joined(separator: ", ")
+        throw MCPError("There's no Visual Design group named “\(wanted)”. Groups: \(names).")
+    }
+
+    /// A group's look. The group in the panel is read from the panel (it's the live copy).
+    func look(ofGroup id: String) -> VisualDesignPanel.Look {
+        if id == activeVisualGroup { return exportDrawer.look }
+        return visualGroups.first(where: { $0.id == id })?.look ?? VisualDesignPanel.Look()
+    }
+
+    /// Gives a group a new look. The group in the panel goes through the panel (so the panel
+    /// shows it); any other group is updated behind the scenes. The selection never changes.
+    func setLook(_ l: VisualDesignPanel.Look, ofGroup id: String) {
+        guard let i = visualGroups.firstIndex(where: { $0.id == id }) else { return }
+        if id == activeVisualGroup {
+            exportDrawer.applyLook(l) { [weak self] name in self?.lutURL(named: name) }
+            return
+        }
+        visualGroups[i].look = l
+        if id == VisualGroup.arollID {
+            // The Default group renders from the grade's own settings and LUTs.
+            grade.settings = VisualDesignPanel.settings(from: l)
+            grade.lut = cachedLUT(l.cameraLUT)
+            grade.creativeLUT = cachedLUT(l.creativeLUT)
+        }
+        syncVisualGroups()   // hands the other groups' looks to the renderer and refreshes the frame
+    }
+
+    /// The A-roll clips in a group (1-based index on V1, file, start and end in timeline seconds),
+    /// and the B-roll shots in it.
+    func timelineClips(inGroup id: String) -> (aroll: [[String: Any]], broll: [[String: Any]]) {
+        var a: [[String: Any]] = []
+        let clips = arollClips()
+        if clips.isEmpty {
+            if id == VisualGroup.arollID, trimBar.duration > 0 {      // a single video: Default grades all of it
+                let file = currentVideo?.lastPathComponent ?? project?.name ?? "video"
+                a.append(["index": 1, "file": file, "start": 0, "end": MCP.r(trimBar.duration),
+                          "startTC": MCP.tc(0), "endTC": MCP.tc(trimBar.duration)])
+            }
+        } else {
+            let edges = [0.0] + trimBar.sourceClipBoundaries + [trimBar.duration]
+            for (k, c) in clips.enumerated() where (c.visualGroup ?? VisualGroup.arollID) == id && k + 1 < edges.count {
+                a.append(["index": k + 1, "file": (c.path as NSString).lastPathComponent,
+                          "start": MCP.r(edges[k]), "end": MCP.r(edges[k + 1]),
+                          "startTC": MCP.tc(edges[k]), "endTC": MCP.tc(edges[k + 1])])
+            }
+        }
+        var b: [[String: Any]] = []
+        for (k, c) in broll.enumerated() where (c.visualGroup ?? VisualGroup.brollID) == id {
+            b.append(["index": k + 1, "at": MCP.r(c.at), "atTC": MCP.tc(c.at), "length": MCP.r(c.length),
+                      "file": MCP.orNull(c.file.map { ($0 as NSString).lastPathComponent })])
+        }
+        return (a, b)
+    }
+
+    /// Imported clips in a group (whether or not they're on the built A-roll).
+    func assetFiles(inGroup id: String) -> [String] {
+        assets.filter { !$0.rejected && ($0.visualGroup ?? VisualGroup.arollID) == id }
+            .sorted { $0.sortDate < $1.sortDate }
+            .map { ($0.path as NSString).lastPathComponent }
     }
 }
