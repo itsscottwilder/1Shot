@@ -476,6 +476,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         transportObservation = nil
         transportBar.setPlaying(false)
         transportBar.setEnabled(false)
+        grade.isPlaying = false
         guard let old = player else { return }
         old.pause()
         rack.detach()
@@ -566,9 +567,14 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         item.videoComposition = composition
         videoComposition = composition
         NSLog("1Shot: color stage attached (render size \(composition.renderSize))")
-        // Taps the finished (color-graded) frames for the Levels histogram.
+        // Taps the finished (color-graded) frames for the Levels histogram. AVFoundation converts
+        // and copies a buffer for this tap on every displayed frame, whether or not updateHistogram()
+        // is actually consuming it that moment — a histogram only needs the rough spread of values,
+        // so a small, fixed size keeps that continuous cost off the full 4K+ frame.
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: 480,
+            kCVPixelBufferHeightKey as String: 270
         ])
         item.add(output)
         videoOutput = output
@@ -702,7 +708,10 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         // or outside the trimmed part starts again from the beginning.
         rateObservation = p.observe(\.rate, options: [.new]) { [weak self] player, _ in
             DispatchQueue.main.async {
-                if let self, player === self.player { self.trimBar.isPlaying = player.rate != 0 }
+                if let self, player === self.player {
+                    self.trimBar.isPlaying = player.rate != 0
+                    self.grade.isPlaying = player.rate != 0
+                }
                 if let self, player === self.player, player.rate != 0 { self.hideTail() }
                 guard let self, player === self.player, player.rate > 0, let range = self.trimRange else { return }
                 let now = self.toSource(player.currentTime().seconds)
@@ -1743,8 +1752,11 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             let composition = self.grade.makeVideoComposition(for: playAsset, mapTime: map, forDisplay: true)
             item.videoComposition = composition
             self.videoComposition = composition
+            // Small and fixed, not full frame size — see the comment where this is first set up.
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 480,
+                kCVPixelBufferHeightKey as String: 270
             ])
             item.add(output)
             self.videoOutput = output

@@ -43,6 +43,16 @@ final class ColorGrade {
     private var _lut: CubeLUT?
     private var _creativeLUT: CubeLUT?
 
+    /// True only while the transport is actually rolling (player.rate != 0), set by the main thread
+    /// as playback starts/stops. Paused and single-frame scrubs always grade at full resolution —
+    /// there's no 30fps deadline to beat for one still frame, and that's exactly when someone is
+    /// most likely to be studying the picture closely (banding, noise, a precise exposure call).
+    private var _isPlaying = false
+    var isPlaying: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _isPlaying }
+        set { lock.lock(); _isPlaying = newValue; lock.unlock() }
+    }
+
     /// The LUT applied first (like a camera profile), or nil for none.
     var lut: CubeLUT? {
         get { lock.lock(); defer { lock.unlock() }; return _lut }
@@ -220,7 +230,21 @@ final class ColorGrade {
             }
             // White balance goes BEFORE the LUT, like setting it in the camera: a log/conversion
             // LUT expects a neutral picture going in, and correcting after it can't fully undo a cast.
-            var graded = ColorGrade.grade(image.cropped(to: frame), s, lut: lut, creativeLUT: creativeLUT)
+            // Live preview, and only while actually playing (never export, never paused/scrubbing):
+            // grade at reduced resolution. The filter chain (denoise, highlight recovery, sharpen,
+            // LUT…) costs roughly scale² less this way, which matters on integrated GPUs previewing
+            // 4K+. B-roll and graphics still composite at full size, so nothing else needs to know
+            // this happened.
+            let previewScale = (forDisplay && self.isPlaying) ? ColorGrade.livePreviewScale(for: frame) : 1
+            var graded: CIImage
+            if previewScale < 0.999 {
+                let shrink = CGAffineTransform(scaleX: previewScale, y: previewScale)
+                let small = image.cropped(to: frame).transformed(by: shrink)
+                let gradedSmall = ColorGrade.grade(small, s, lut: lut, creativeLUT: creativeLUT)
+                graded = gradedSmall.transformed(by: shrink.inverted()).cropped(to: frame)
+            } else {
+                graded = ColorGrade.grade(image.cropped(to: frame), s, lut: lut, creativeLUT: creativeLUT)
+            }
 
             // B-roll (V2) covers the talking head while it's on, graded by its own group's look.
             // A picture-in-picture shot (3.2) sits in its box over the talking head instead.
@@ -266,6 +290,17 @@ final class ColorGrade {
             comp.colorTransferFunction = AVVideoTransferFunction_IEC_sRGB   // sRGB shares 709's primaries
         }
         return comp
+    }
+
+    /// How much to shrink the grading chain's working image for live preview: 1 (no change) up to
+    /// a clip whose longer side is already at or under the cap, scaling down proportionally above it.
+    /// Keeps the preview's grade at a size integrated GPUs can push every frame, without touching
+    /// what gets exported.
+    private static let livePreviewLongSideCap: CGFloat = 1920
+    static func livePreviewScale(for frame: CGRect) -> CGFloat {
+        let longSide = max(frame.width, frame.height)
+        guard longSide > livePreviewLongSideCap else { return 1 }
+        return livePreviewLongSideCap / longSide
     }
 
     /// What the eyedropper measures: the frame exactly as the player's pipeline has it right

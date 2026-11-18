@@ -7,6 +7,7 @@
 // drifts more than about a tenth of a second.
 
 import AVFoundation
+import os
 
 enum RackError: LocalizedError {
     case message(String)
@@ -270,7 +271,9 @@ final class AudioRack {
     private(set) var lastError: String?
 
     // Output meter readings (written by the meter tap, read by the drawer).
-    private let meterLock = NSLock()
+    // os_unfair_lock, not NSLock: the write side runs on the tap's audio-render-adjacent thread,
+    // where a heavier mutex risks a priority inversion against the main thread and an audible glitch.
+    private var meterLock = os_unfair_lock()
     private var meterPeak: [Float] = [0, 0]
     private var meterRMS: [Float] = [0, 0]
     private var meterStamp: TimeInterval = 0
@@ -737,12 +740,12 @@ final class AudioRack {
                 peaks[c] = peak
                 rms[c] = (sum / Float(frames)).squareRoot()
             }
-            self.meterLock.lock()
+            os_unfair_lock_lock(&self.meterLock)
             self.meterPeak = peaks
             self.meterRMS = rms
             self.meterStamp = ProcessInfo.processInfo.systemUptime
             let volume = self.liveVolume
-            self.meterLock.unlock()
+            os_unfair_lock_unlock(&self.meterLock)
             // Loudness of the mix itself, as it will export (the player volume taken back out).
             if volume > 0.05 { self.loudness.process(buffer, gain: 1 / volume) }
         }
@@ -756,7 +759,7 @@ final class AudioRack {
 
     /// Latest output levels (linear). Silence if nothing has played for a moment.
     func meterReading() -> (peak: [Float], rms: [Float]) {
-        meterLock.lock(); defer { meterLock.unlock() }
+        os_unfair_lock_lock(&meterLock); defer { os_unfair_lock_unlock(&meterLock) }
         if ProcessInfo.processInfo.systemUptime - meterStamp > 0.15 { return ([0, 0], [0, 0]) }
         return (meterPeak, meterRMS)
     }
@@ -987,6 +990,6 @@ final class AudioRack {
     private func updateVolume() {
         guard !isExporting, let player else { return }
         engine.mainMixerNode.outputVolume = player.isMuted ? 0 : player.volume
-        meterLock.lock(); liveVolume = engine.mainMixerNode.outputVolume; meterLock.unlock()
+        os_unfair_lock_lock(&meterLock); liveVolume = engine.mainMixerNode.outputVolume; os_unfair_lock_unlock(&meterLock)
     }
 }
