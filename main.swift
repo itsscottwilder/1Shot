@@ -362,6 +362,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         place(playerView, NSRect(x: 0, y: barHeight, width: videoWidth, height: b.height - barHeight))
         eyedropperView.frame = playerView.frame
         place(rightPanel, NSRect(x: videoWidth, y: 0, width: pw, height: b.height))
+        placeStepTip()
+        if open { DispatchQueue.main.async { [weak self] in self?.showStepTipIfNeeded() } }
         DispatchQueue.main.async { [weak self] in self?.updatePlateHandles(); self?.updateBrollHandles() }   // the video moved
     }
 
@@ -381,6 +383,55 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         if tab == .visualDesign { refreshFrame() }   // fresh frame for the histogram when paused
         updatePlateHandles()
         updateBrollHandles()
+        showStepTipIfNeeded()
+    }
+
+    // MARK: Step tips (3.4.0)
+
+    private var stepTipCard: StepTipCard?
+    private var seenStepTips = Set<WorkspaceTab>()
+    private var stepTipObserver: NSObjectProtocol?
+
+    /// The first time each step is opened in this window, an explainer card pops up over the video.
+    func showStepTipIfNeeded() {
+        guard project != nil, !StepTipCard.turnedOff, !seenStepTips.contains(currentTab) else { return }
+        seenStepTips.insert(currentTab)
+        closeStepTip()
+        if stepTipObserver == nil {
+            stepTipObserver = NotificationCenter.default.addObserver(forName: StepTipCard.turnedOffNotification,
+                                                                     object: nil, queue: .main) { [weak self] _ in
+                self?.closeStepTip()
+            }
+        }
+        let card = StepTipCard(tab: currentTab)
+        card.onClose = { [weak self] in self?.closeStepTip() }
+        // In the player's overlay layer: views merely stacked over AVPlayerView draw but never get clicks.
+        guard let host = playerView.contentOverlayView else { return }
+        host.addSubview(card, positioned: .above, relativeTo: nil)
+        stepTipCard = card
+        placeStepTip()
+        card.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.2; card.animator().alphaValue = 1 }
+    }
+
+    /// Help › Show Step Tips Again: forget what's been seen and show this step's card now.
+    func resetStepTips() {
+        seenStepTips = []
+        showStepTipIfNeeded()
+    }
+
+    func closeStepTip() {
+        stepTipCard?.removeFromSuperview()
+        stepTipCard = nil
+    }
+
+    /// Centred over the video, never taller than it.
+    private func placeStepTip() {
+        guard let card = stepTipCard else { return }
+        guard let area = card.superview?.bounds else { return }
+        let size = card.frame.size
+        card.setFrameOrigin(NSPoint(x: (area.midX - size.width / 2).rounded(),
+                                    y: max(area.minY + 8, (area.midY - size.height / 2).rounded())))
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -2595,13 +2646,23 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         updated[assetIndex] = entry
+        applyAssetTrims(updated) { [weak self] ok in
+            if !ok { self?.showAlert("Couldn't resize the clip", "The source clips couldn't be assembled. No changes were made.") }
+        }
+    }
+
+    /// Saves new in/out points for the source clips and rebuilds V1 from them (3.4.0). The timeline
+    /// trim, cuts, zooms, B-roll and graphics are cleared: they were placed against the old timeline.
+    /// `done(false)` = the clips couldn't be assembled and nothing changed.
+    func applyAssetTrims(_ updated: [AssetEntry], done: @escaping (Bool) -> Void) {
+        guard let project else { done(false); return }
         let newIncluded = updated.filter { !$0.rejected }.sorted { $0.sortDate < $1.sortDate }
         Task { @MainActor in
             guard let comp = await Self.assembleComposition(assets: newIncluded, in: project) else {
-                self.showAlert("Couldn't resize the clip", "The source clips couldn't be assembled. No changes were made.")
+                done(false)
                 return
             }
-            guard self.project === project else { return }
+            guard self.project === project else { done(false); return }
             self.clearCuts()
             self.clearZooms()
             self.clearBroll()
@@ -2627,6 +2688,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             // Persist the asset trims immediately; the player is loaded asynchronously.
             project.data.assets = updated
             do { try project.save() } catch { self.showAlert("Couldn't save the project", error.localizedDescription) }
+            done(true)
         }
     }
 
@@ -3604,6 +3666,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         controller?.selectTab(.assets)
     }
 
+    @objc func showStepTipsAgain(_ sender: Any?) {
+        StepTipCard.turnedOff = false
+        controller?.resetStepTips()
+    }
+
     @objc func resetTrim(_ sender: Any?) {
         controller?.resetTrim()
     }
@@ -3765,6 +3832,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         window.addItem(withTitle: "Front Project Window", action: #selector(showMainWindow(_:)), keyEquivalent: "1")
         main.addItem(submenu(window))
         NSApp.windowsMenu = window
+
+        // Help
+        let help = NSMenu(title: "Help")
+        help.addItem(withTitle: "Show Step Tips Again", action: #selector(showStepTipsAgain(_:)), keyEquivalent: "")
+        main.addItem(submenu(help))
+        NSApp.helpMenu = help
 
         return main
     }

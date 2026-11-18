@@ -10,7 +10,7 @@
 
 import Foundation
 
-let serverVersion = "2.8.0"
+let serverVersion = "2.10.0"
 let bundleID = "com.itsscottwilder.timecodeplayer"
 let supportPath = NSHomeDirectory() + "/Library/Application Support/1Shot"
 let socketPath = supportPath + "/mcp.sock"
@@ -178,7 +178,7 @@ let tool_snapshot_frame: [String: Any] = [
 
 let tool_get_settings: [String: Any] = [
     "name": "get_settings",
-    "description": "Every Visual Design setting and Sound Design setting. Visual Design is per group: every clip belongs to a Visual Design group (Default, B-roll and any the user made), and each group has its own look (sliders incl. white balance, bypassed, Levels, Camera/Creative LUT). With no group: visualDesign.groups lists every group with its clips and settings, plus activeGroup (shown in the panel) and defaultTarget (what set_visual changes when you pass no group). With group: just that group. Stabilize, smoothness, maxCrop, fade and colorBypass are project-wide (visualDesign.projectWide). Sound Design: (voice isolation, high pass, gate, compressor, de-esser, limiter) in raw and plain units, plus the live output meter. Also the live Loudness (LUFS) meters. measure: true also measures the original recording inside the trim (integrated LUFS, peak, noise floor, speech level) and the whole edit after Sound Design, exactly as it will export (target −14 LUFS; the export can normalize to it). Pipeline steps 1–2 are the user's for now: read their settings, explain what you think each choice is for, say which you can't explain, and stop for their approval.",
+    "description": "Every Visual Design setting and Sound Design setting. Visual Design is per group: every clip belongs to a Visual Design group (Default, B-roll and any the user made), and each group has its own look (sliders incl. white balance, bypassed, Levels, Camera/Creative LUT). With no group: visualDesign.groups lists every group with its clips and settings, plus activeGroup (shown in the panel) and defaultTarget (what set_visual changes when you pass no group). With group: just that group. Stabilize, smoothness, maxCrop, fade and colorBypass are project-wide (visualDesign.projectWide). Sound Design: (voice isolation, high pass, gate, compressor, de-esser, limiter) in raw and plain units, plus the live output meter. Also the live Loudness (LUFS) meters. measure: true also measures the original recording inside the trim (integrated LUFS, peak, noise floor, speech level) and the whole edit after Sound Design, exactly as it will export (target −14 LUFS; the export can normalize to it). Pipeline steps 3–4 are the user's for now: read their settings, explain what you think each choice is for, say which you can't explain, and stop for their approval.",
     "inputSchema": ["type": "object", "properties": [
         "group": prop("string", "A Visual Design group's name (e.g. \"Default\"): return only that group. Leave out for every group."),
         "measure": prop("boolean", "Also measure the loudness of the original recording and of the whole edit after Sound Design (pauses playback; a few seconds to a minute).")
@@ -232,9 +232,51 @@ let tool_set_sound: [String: Any] = [
     ]]
 ]
 
+let tool_find_dead_air: [String: Any] = [
+    "name": "find_dead_air",
+    "description": "Pipeline step 1. Measures the silence at the start and end of every clip in the Assets tab (oldest first, numbered from 1; rejected clips are skipped) and proposes each clip's in/out: lead seconds before the first sound, tail seconds after the last. Times are seconds in each clip's own file. Changes nothing. Show the user each clip's dead air and proposed in/out, then stop for approval.",
+    "inputSchema": ["type": "object", "properties": [
+        "clips": ["type": "array", "items": ["type": "integer"], "description": "Only these clips (numbers from 1, oldest first). Default: all."],
+        "lead": prop("number", "Seconds to keep before the first sound, 0–2. Default 0.3."),
+        "tail": prop("number", "Seconds to keep after the last sound, 0–3. Default 0.5.")
+    ]],
+    "annotations": ["readOnlyHint": true]
+]
+
+let tool_set_clip_trims: [String: Any] = [
+    "name": "set_clip_trims",
+    "description": "Pipeline step 1. Sets the in/out of one or more Assets-tab clips (seconds in each clip's own file; clips you leave out keep theirs) and rebuilds the A-roll from them. If the A-roll already has cuts, zooms, B-roll or graphics, this refuses unless clearEdits: true, because the timeline shifts and they are cleared: ask the user first. Answers with every clip's in/out and the A-roll length. Use only the in/out points the user approved.",
+    "inputSchema": ["type": "object", "properties": [
+        "clips": ["type": "array", "description": "One entry per clip to change.", "items": ["type": "object", "properties": [
+            "clip": prop("integer", "Clip number from find_dead_air (from 1, oldest first)."),
+            "in": prop("number", "In point, seconds in the clip's file."),
+            "out": prop("number", "Out point, seconds in the clip's file.")
+        ], "required": ["clip"]]],
+        "clearEdits": prop("boolean", "true = OK to clear cuts, zooms, B-roll and graphics (only after the user agrees).")
+    ], "required": ["clips"]]
+]
+
+let tool_compare_clips: [String: Any] = [
+    "name": "compare_clips",
+    "description": "Pipeline step 2. A contact sheet of every Assets-tab clip (oldest first, numbered from 1): three frames each, at 10 %, 50 % and 90 % of its in/out, as recorded. Also each clip's current Visual Design group and a rough difference score for every pair (0 = identical, higher = more different). Changes nothing. Compare the looks, propose groups (clip 1's look is Default; every other look gets a new group named after what it looks like), then stop for approval.",
+    "inputSchema": ["type": "object", "properties": [:] as [String: Any]],
+    "annotations": ["readOnlyHint": true]
+]
+
+let tool_set_clip_groups: [String: Any] = [
+    "name": "set_clip_groups",
+    "description": "Pipeline step 2. Puts Assets-tab clips into Visual Design groups. The group containing clip 1 is always Default (its name is ignored). Any other name is an existing group or makes a new one. Clips you leave out stay where they are. Answers with every group and every clip's group. Use only the grouping the user approved.",
+    "inputSchema": ["type": "object", "properties": [
+        "groups": ["type": "array", "description": "One entry per group.", "items": ["type": "object", "properties": [
+            "name": prop("string", "Group name, describing the look (e.g. \"Close-up – lamp light\"). Ignored for the group with clip 1 (Default)."),
+            "clips": ["type": "array", "items": ["type": "integer"], "description": "Clip numbers from compare_clips."]
+        ], "required": ["clips"]]]
+    ], "required": ["groups"]]
+]
+
 let tool_set_trim: [String: Any] = [
     "name": "set_trim",
-    "description": "Pipeline step 3. Sets where the usable recording starts and ends (seconds on the original clip), or reset: true for the whole clip. Answers with the first and last words inside the trim (when there's a transcript). Show the user the in/out with those words, then stop for approval.",
+    "description": "Pipeline step 5. Sets where the usable recording starts and ends (seconds on the original clip), or reset: true for the whole clip. Answers with the first and last words inside the trim (when there's a transcript). Show the user the in/out with those words, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "start": prop("number", "Trim in, seconds on the original clip."),
         "end": prop("number", "Trim out, seconds on the original clip."),
@@ -261,7 +303,7 @@ let tool_read_transcript: [String: Any] = [
 
 let tool_apply_cuts: [String: Any] = [
     "name": "apply_cuts",
-    "description": "Pipeline steps 4 and 5. Puts a cut list on the timeline (pieces removed from inside the trim). Step 4 (pauses, dead air): mode replace. Step 5 (false starts, retakes, stumbles): mode add, so the pause cuts stay. Follow the 'Default - Talking Head' style guide (read_style_guide). Answers with every cut, the words it removes, the new length and warnings (cuts under 1 s that aren't mistakes, edges inside a word). Show the user the summary (step 4) or each cut with its words (step 5), then stop for approval.",
+    "description": "Pipeline steps 6 and 7. Puts a cut list on the timeline (pieces removed from inside the trim). Step 6 (pauses, dead air): mode replace. Step 7 (false starts, retakes, stumbles): mode add, so the pause cuts stay. Follow the 'Default - Talking Head' style guide (read_style_guide). Answers with every cut, the words it removes, the new length and warnings (cuts under 1 s that aren't mistakes, edges inside a word). Show the user the summary (step 6) or each cut with its words (step 7), then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "cuts": ["type": "array", "description": "Cuts: {start, end, reason (pause, false-start, retake, dead-air, other), note}. Seconds on the original clip.",
                  "items": ["type": "object", "properties": [
@@ -276,7 +318,7 @@ let tool_apply_cuts: [String: Any] = [
 
 let tool_apply_zooms: [String: Any] = [
     "name": "apply_zooms",
-    "description": "Pipeline step 6. Replaces the punch-in zooms. Follow the 'Zooms - Talking Head' style guide (read_style_guide): instant zooms only, scales 1.00 / 1.28 / 1.40. Answers with each zoom and its words, plus warnings. Show the user each zoom with its words, then stop for approval.",
+    "description": "Pipeline step 8. Replaces the punch-in zooms. Follow the 'Zooms - Talking Head' style guide (read_style_guide): instant zooms only, scales 1.00 / 1.28 / 1.40. Answers with each zoom and its words, plus warnings. Show the user each zoom with its words, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "zooms": ["type": "array", "description": "Zooms: {at, scale, type (punch-in, reset, cta), reason, words, anchorX, anchorY}.",
                   "items": ["type": "object", "properties": [
@@ -291,7 +333,7 @@ let tool_apply_zooms: [String: Any] = [
 
 let tool_apply_broll: [String: Any] = [
     "name": "apply_broll",
-    "description": "Pipeline step 7. Puts B-roll on V2 and downloads it into the project (Pixabay video by search, Unsplash photo by url). STOCK ONLY for now: shots with a file are refused. Follow the 'B-roll - Talking Head' style guide (read_style_guide). The user's own manually added clips stay. Downloads can take a while: if not done in 45 s, call status with wait: 45. Show the user the spots and what's on V2, then stop for approval.",
+    "description": "Pipeline step 9. Puts B-roll on V2 and downloads it into the project (Pixabay video by search, Unsplash photo by url). STOCK ONLY for now: shots with a file are refused. Follow the 'B-roll - Talking Head' style guide (read_style_guide). The user's own manually added clips stay. Downloads can take a while: if not done in 45 s, call status with wait: 45. Show the user the spots and what's on V2, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "broll": ["type": "array", "description": "Shots: {at, length, kind (video/photo), and exactly one of pixabayId (a clip the user picked from a candidate sheet; preferred), search (Pixabay's top match, unchecked) or url (an Unsplash photo with credit, or a Pixabay link the user pasted, which becomes that exact clip), reason, words}.",
                   "items": ["type": "object", "properties": [
@@ -377,7 +419,7 @@ let tool_graphics_preview: [String: Any] = [
 
 let tool_apply_graphics: [String: Any] = [
     "name": "apply_graphics",
-    "description": "Pipeline step 8, Motion Graphics: places the plates the user approved on V3 (replaces the current set; mode clear removes them all). They show in the preview and the export, above B-roll, never zoomed or graded. Show the user what's placed, then stop for approval.",
+    "description": "Pipeline step 10, Motion Graphics: places the plates the user approved on V3 (replaces the current set; mode clear removes them all). They show in the preview and the export, above B-roll, never zoomed or graded. Show the user what's placed, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
         "graphics": ["type": "array", "items": plateSchema],
         "mode": ["type": "string", "enum": ["replace", "clear"]],
@@ -417,7 +459,7 @@ let tool_graphics_style: [String: Any] = [
 
 let tool_read_style_guide: [String: Any] = [
     "name": "read_style_guide",
-    "description": "The editing style guides from ~/Movies/1Shot/Style Guides (the ones the app uses). With no name: lists them. With a name: the full guide. Read the matching guide before steps 4–7 and follow its MUST/NEVER rules exactly.",
+    "description": "The editing style guides from ~/Movies/1Shot/Style Guides (the ones the app uses). With no name: lists them. With a name: the full guide. Read the matching guide before steps 6–9 and follow its MUST/NEVER rules exactly.",
     "inputSchema": ["type": "object", "properties": [
         "name": prop("string", "e.g. \"Default - Talking Head\", \"Zooms - Talking Head\", \"B-roll - Talking Head\".")
     ]],
@@ -431,6 +473,10 @@ let tools: [[String: Any]] = [
     tool_get_settings,
     tool_set_visual,
     tool_list_groups,
+    tool_find_dead_air,
+    tool_set_clip_trims,
+    tool_compare_clips,
+    tool_set_clip_groups,
     tool_set_sound,
     tool_set_trim,
     tool_create_transcript,
@@ -454,17 +500,19 @@ let instructions = """
 
 Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after every step. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.
-1 Visual Design: The user does this themself for now. Each clip belongs to a Visual Design group with its own look; list_groups shows them. Use get_settings and snapshot_frame to read their choices group by group, explain what you think each is for, and say plainly which you can't explain. Use set_visual only if they ask.
-2 Sound Design: The user does this themself for now. Use get_settings with measure: true and explain the same way, including how far the edit is from YouTube's −14 LUFS. You can't listen, so their ears are the final say. Use set_sound only if they ask.
-3 Start and stop points: create_transcript, read_transcript, then set_trim. Show in/out with the first and last words.
-4 Ums, ahs and long silences: apply_cuts (mode replace) per the "Default - Talking Head" style guide. Show the count, seconds removed and a few examples. Filler words are often missing from the transcript, so expect the user to check this step.
-5 Repeated phrases and mistakes: apply_cuts (mode add) per the same guide. Show each cut with the words it removes.
-6 Zooms: apply_zooms per "Zooms - Talking Head". Show each zoom with its words.
-7 B-roll: per "B-roll - Talking Head", stock only (Pixabay video, Unsplash photos). First choose all the spots and show them as a list; the user approves the spots. Then go through the spots ONE AT A TIME: for the current spot only, run broll_candidates with a search (up to 40 results), pick your 10 favorites that truly match the words, and show the user a sheet of just those (broll_candidates with ids and a title naming the spot), with each clip's page link and which one you'd pick. Then STOP: The user picks the winner by number, or gives a different phrase to search; for a new phrase, search it and show a new top 10 for the same spot. Place the winner with apply_broll using pixabayId (apply_broll replaces the list, so send every clip picked so far), then move to the next spot. Never search ahead, never show two spots at once, never place a clip the user didn't pick. If a sheet is thin, widen it with also, or ask the user for the link to a clip they see on pixabay.com (a pasted link works in ids and in apply_broll's url). Every clip the user picks is approved: when it's placed, the app copies it into the shared B-roll Library (~/Movies/1Shot/B-roll Library, listed in library.json with credit, page and words) so every project can reuse it, and placing a clip that's already there copies it instead of downloading it again. When the user asks to keep a clip they didn't place (a runner-up), save it with save_to_broll_library. A shot can also be framed: zoom (1–3, 1 = fill) and panX/panY (−1…1) on the shot in apply_broll zoom into it and pick which part shows. A shot can also be picture-in-picture: pipScale (0.15–1, size of the frame) and pipX/pipY (its centre in the 1920×1080 frame, y down) put it in a rounded box over the speaker; the user can also drag it on the video in the B-roll tab. apply_broll replaces the list, so send each shot's pip fields back unchanged. Never use a vertical (portrait) video: horizontal only (the app leaves them off sheets and refuses to place one).
-8 Motion Graphics (playful style: elements animate beside the speaker; full-screen only for the 1–2 biggest points; about one plate every 15–20 s): graphics_templates first. From the transcript, choose spots and propose plates (template, words, the red word marked with *asterisks*, side opposite the speaker for overlays, builds on the words for bullets). Show them with graphics_preview and list each with its time and words; stop for the user's picks and edits. Then apply_graphics with only what they approved, and stop for approval. For size or position tweaks after that, use adjust_graphics (one plate) or graphics_style (all plates); both are instant. Charts and numbers use the user's real numbers only: ask, never make them up. Keep plates off the speaker's face unless it's a deliberate comedic beat. The app does not check the face: plates go exactly where side, scale and dx/dy put them, so pick the side away from the speaker and check the preview sheet; the user fine-tunes size and position in the Graphics tab. Always include a name plate: a lowerThird with the user's channel handle as title and their tagline as subtitle, in the first 10–15 s of the edited video. Ask the user for the handle and tagline if you don't know them; never guess.
-9 Export: not available in this version yet. The user exports with ⌘Y; its save sheet has a "Normalize loudness to −14 LUFS" checkbox (on by default).
+1 Clip in/out points: the first thing after the clips are in the Assets tab. find_dead_air measures the silence at the start and end of each clip and proposes an in/out for each. Show every clip with its dead air at start and end and the proposed in/out, flag anything odd (no voice found, a noise that may have been counted as sound), then STOP. The user approves or changes them; set_clip_trims applies the approved ones and rebuilds the A-roll. If the project has no Assets-tab clips (one video), skip this step.
+2 Visual Design groups: compare_clips shows every clip (three frames each, as recorded) and a rough difference score per pair. Clip 1 defines the Default group: clips that look like it (same camera angle, framing, lighting, background, colour) stay in Default; each different look gets its own new group, named after what it looks like (e.g. "Close-up – lamp light"). Show the proposed groups with the reason for each, then STOP. After approval, set_clip_groups applies them. Skip this step if the project has one clip.
+3 Visual Design: The user does this themself for now. Each clip belongs to a Visual Design group with its own look; list_groups shows them. Use get_settings and snapshot_frame to read their choices group by group, explain what you think each is for, and say plainly which you can't explain. Use set_visual only if they ask.
+4 Sound Design: The user does this themself for now. Use get_settings with measure: true and explain the same way, including how far the edit is from YouTube's −14 LUFS. You can't listen, so their ears are the final say. Use set_sound only if they ask.
+5 Start and stop points: create_transcript, read_transcript, then set_trim. Show in/out with the first and last words.
+6 Ums, ahs and long silences: apply_cuts (mode replace) per the "Default - Talking Head" style guide. Show the count, seconds removed and a few examples. Filler words are often missing from the transcript, so expect the user to check this step.
+7 Repeated phrases and mistakes: apply_cuts (mode add) per the same guide. Show each cut with the words it removes.
+8 Zooms: apply_zooms per "Zooms - Talking Head". Show each zoom with its words.
+9 B-roll: per "B-roll - Talking Head", stock only (Pixabay video, Unsplash photos). First choose all the spots and show them as a list; the user approves the spots. Then go through the spots ONE AT A TIME: for the current spot only, run broll_candidates with a search (up to 40 results), pick your 10 favorites that truly match the words, and show the user a sheet of just those (broll_candidates with ids and a title naming the spot), with each clip's page link and which one you'd pick. Then STOP: The user picks the winner by number, or gives a different phrase to search; for a new phrase, search it and show a new top 10 for the same spot. Place the winner with apply_broll using pixabayId (apply_broll replaces the list, so send every clip picked so far), then move to the next spot. Never search ahead, never show two spots at once, never place a clip the user didn't pick. If a sheet is thin, widen it with also, or ask the user for the link to a clip they see on pixabay.com (a pasted link works in ids and in apply_broll's url). Every clip the user picks is approved: when it's placed, the app copies it into the shared B-roll Library (~/Movies/1Shot/B-roll Library, listed in library.json with credit, page and words) so every project can reuse it, and placing a clip that's already there copies it instead of downloading it again. When the user asks to keep a clip they didn't place (a runner-up), save it with save_to_broll_library. A shot can also be framed: zoom (1–3, 1 = fill) and panX/panY (−1…1) on the shot in apply_broll zoom into it and pick which part shows. A shot can also be picture-in-picture: pipScale (0.15–1, size of the frame) and pipX/pipY (its centre in the 1920×1080 frame, y down) put it in a rounded box over the speaker; the user can also drag it on the video in the B-roll tab. apply_broll replaces the list, so send each shot's pip fields back unchanged. Never use a vertical (portrait) video: horizontal only (the app leaves them off sheets and refuses to place one).
+10 Motion Graphics (playful style: elements animate beside the speaker; full-screen only for the 1–2 biggest points; about one plate every 15–20 s): graphics_templates first. From the transcript, choose spots and propose plates (template, words, the red word marked with *asterisks*, side opposite the speaker for overlays, builds on the words for bullets). Show them with graphics_preview and list each with its time and words; stop for the user's picks and edits. Then apply_graphics with only what they approved, and stop for approval. For size or position tweaks after that, use adjust_graphics (one plate) or graphics_style (all plates); both are instant. Charts and numbers use the user's real numbers only: ask, never make them up. Keep plates off the speaker's face unless it's a deliberate comedic beat. The app does not check the face: plates go exactly where side, scale and dx/dy put them, so pick the side away from the speaker and check the preview sheet; the user fine-tunes size and position in the Graphics tab. Always include a name plate: a lowerThird with the user's channel handle as title and their tagline as subtitle, in the first 10–15 s of the edited video. Ask the user for the handle and tagline if you don't know them; never guess.
+11 Export: not available in this version yet. The user exports with ⌘Y; its save sheet has a "Normalize loudness to −14 LUFS" checkbox (on by default).
 
-Read the style guide with read_style_guide before steps 4 to 8. All times are seconds on the ORIGINAL clip, the same clock as the transcript. If a tool says a dialog is open in the app, ask the user to close it.
+Read the style guide with read_style_guide before steps 6 to 10. All times are seconds on the ORIGINAL clip, the same clock as the transcript. If a tool says a dialog is open in the app, ask the user to close it.
 """
 
 // MARK: - MCP (JSON-RPC 2.0 over stdio)

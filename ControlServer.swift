@@ -339,6 +339,8 @@ extension PlayerWindowController {
         // Follow along (2026-11-11): each pipeline step switches the app to its own tab,
         // so the panel and timeline show what Claude just changed.
         let stepTab: [String: WorkspaceTab] = [
+            "find_dead_air": .assets, "set_clip_trims": .assets,
+            "compare_clips": .assets, "set_clip_groups": .assets,
             "set_visual": .visualDesign, "set_sound": .soundDesign,
             "apply_cuts": .cuts, "apply_zooms": .zooms,
             "apply_broll": .broll, "broll_candidates": .broll, "save_to_broll_library": .broll,
@@ -356,6 +358,10 @@ extension PlayerWindowController {
             case "list_groups":       done(.success(mcpListGroups()))
             case "set_sound":         done(.success(try mcpSetSound(args)))
             case "set_trim":          done(.success(try mcpSetTrim(args)))
+            case "find_dead_air":     try mcpFindDeadAir(args, done)
+            case "set_clip_trims":    try mcpSetClipTrims(args, done)
+            case "compare_clips":     try mcpCompareClips(args, done)
+            case "set_clip_groups":   done(.success(try mcpSetClipGroups(args)))
             case "create_transcript": try mcpCreateTranscript(args, done)
             case "read_transcript":   done(.success(try mcpReadTranscript(args)))
             case "apply_cuts":        done(.success(try mcpApplyCuts(args)))
@@ -923,6 +929,240 @@ extension PlayerWindowController {
         return ["soundDesign": MCP.json(now), "readable": mcpReadable(now)] as [String: Any]
     }
 
+    // MARK: Clip in/out (3.4.0)
+
+    /// The clips that go into the A-roll, oldest first — the numbering find_dead_air and set_clip_trims use.
+    private var mcpIncludedAssets: [AssetEntry] {
+        assets.filter { !$0.rejected }.sorted { $0.sortDate < $1.sortDate }
+    }
+
+    private func mcpClipJSON(_ a: AssetEntry, index: Int) -> [String: Any] {
+        ["clip": index, "file": (a.path as NSString).lastPathComponent,
+         "duration": MCP.r(a.duration), "in": MCP.r(a.inPoint), "out": MCP.r(a.outPoint),
+         "length": MCP.r(a.outPoint - a.inPoint), "lengthTC": MCP.tc(a.outPoint - a.inPoint)]
+    }
+
+    /// Measures the silence at the start and end of every clip (or the ones in `clips`) and proposes
+    /// an in/out for each: `lead` seconds before the first sound, `tail` seconds after the last.
+    private func mcpFindDeadAir(_ args: [String: Any], _ done: @escaping MCPReply) throws {
+        try mcpRequireIdle()
+        guard let project else { throw MCPError("Open a project first (open_project).") }
+        let included = mcpIncludedAssets
+        guard !included.isEmpty else {
+            throw MCPError("This project has no clips in the Assets tab (or every clip is rejected). Ask the user to import their clips.")
+        }
+        var wanted = Array(1...included.count)
+        if let list = args["clips"] as? [Any] {
+            wanted = try list.map {
+                guard let n = MCP.num($0), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
+                    throw MCPError("clips are numbers 1–\(included.count) (oldest first).")
+                }
+                return Int(n)
+            }
+        }
+        let lead = min(2, max(0, MCP.num(args["lead"]) ?? 0.3))
+        let tail = min(3, max(0, MCP.num(args["tail"]) ?? 0.5))
+        let jobs = wanted.map { (index: $0, entry: included[$0 - 1], url: project.folder.appendingPathComponent(included[$0 - 1].path)) }
+
+        Task { @MainActor in
+            var clips: [[String: Any]] = []
+            for job in jobs {
+                var c = self.mcpClipJSON(job.entry, index: job.index)
+                do {
+                    let url = job.url
+                    let r = try await Task.detached(priority: .userInitiated) { try await DeadAir.analyze(url: url) }.value
+                    let duration = job.entry.duration > 0 ? job.entry.duration : r.duration
+                    c["noiseFloorDb"] = MCP.r(r.noiseFloorDb, 1)
+                    c["voiceDb"] = MCP.r(r.speechDb, 1)
+                    if let first = r.firstSound, let last = r.lastSound, last > first {
+                        let proposedIn = max(0, first - lead)
+                        let proposedOut = min(duration, last + tail)
+                        c["firstSoundAt"] = MCP.r(first)
+                        c["lastSoundEndsAt"] = MCP.r(last)
+                        c["deadAirAtStart"] = MCP.r(first)
+                        c["deadAirAtEnd"] = MCP.r(max(0, duration - last))
+                        c["proposedIn"] = MCP.r(proposedIn)
+                        c["proposedOut"] = MCP.r(proposedOut)
+                        c["proposedInTC"] = MCP.tc(proposedIn)
+                        c["proposedOutTC"] = MCP.tc(proposedOut)
+                        c["proposedLength"] = MCP.r(proposedOut - proposedIn)
+                    } else {
+                        c["note"] = "No clear voice found (the loud and quiet parts are within 10 dB). Leave this clip's in/out as it is and tell the user."
+                    }
+                } catch {
+                    c["error"] = error.localizedDescription
+                }
+                clips.append(c)
+            }
+            done(.success([
+                "clips": clips,
+                "lead": lead, "tail": tail,
+                "howToRead": "Times are seconds in each clip's own file. deadAirAtStart/End is the silence before the first and after the last sound lasting 200 ms or more. proposedIn = first sound − lead, proposedOut = last sound + tail. A noise (a chair, a cough, a clap) counts as sound, so a long clip that seems to start late or end early is worth flagging. You can't hear: show the user each clip's dead air and proposal, then set_clip_trims with the ones they approve."
+            ] as [String: Any]))
+        }
+    }
+
+    /// Sets the in/out of one or more clips and rebuilds the A-roll from them.
+    private func mcpSetClipTrims(_ args: [String: Any], _ done: @escaping MCPReply) throws {
+        try mcpRequireIdle()
+        guard project != nil else { throw MCPError("Open a project first (open_project).") }
+        let included = mcpIncludedAssets
+        guard !included.isEmpty else { throw MCPError("This project has no clips in the Assets tab.") }
+        guard let list = args["clips"] as? [[String: Any]], !list.isEmpty else {
+            throw MCPError("clips is a list of {clip, in, out}, with clip numbered 1–\(included.count) (oldest first).")
+        }
+        var updated = assets
+        var touched = Set<UUID>()
+        for item in list {
+            guard let n = MCP.num(item["clip"]), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
+                throw MCPError("clip is a number 1–\(included.count) (oldest first).")
+            }
+            let entry = included[Int(n) - 1]
+            guard let idx = updated.firstIndex(where: { $0.id == entry.id }) else { continue }
+            if touched.contains(entry.id) { throw MCPError("Clip \(Int(n)) is listed twice.") }
+            touched.insert(entry.id)
+            let i = MCP.num(item["in"]) ?? entry.inPoint
+            let o = min(entry.duration, MCP.num(item["out"]) ?? entry.outPoint)
+            guard i >= 0, o - i >= 0.5 else {
+                throw MCPError("Clip \(Int(n)): in has to be 0 or later and at least 0.5 s before out (the file is \(MCP.r(entry.duration)) s).")
+            }
+            updated[idx].inPoint = i
+            updated[idx].outPoint = o
+        }
+        let changed = zip(assets, updated).contains { abs($0.inPoint - $1.inPoint) > 0.001 || abs($0.outPoint - $1.outPoint) > 0.001 }
+        let hasEdits = !cuts.isEmpty || !zooms.isEmpty || !broll.isEmpty || !graphics.isEmpty
+        if changed, hasEdits, args["clearEdits"] as? Bool != true {
+            throw MCPError("The A-roll already has cuts, zooms, B-roll or graphics. Changing a clip's in/out shifts the timeline and clears them all. Ask the user; if they agree, call again with clearEdits: true.")
+        }
+
+        func answer() -> [String: Any] {
+            let now = mcpIncludedAssets
+            let total = now.reduce(0) { $0 + ($1.outPoint - $1.inPoint) }
+            return ["clips": now.enumerated().map { mcpClipJSON($1, index: $0 + 1) },
+                    "arollLength": MCP.r(total), "arollLengthTC": MCP.tc(total),
+                    "changed": changed, "rebuilt": changed]
+        }
+        guard changed else { done(.success(answer())); return }
+        applyAssetTrims(updated) { ok in
+            if ok { done(.success(answer())) }
+            else { done(.failure(MCPError("The clips couldn't be assembled. Nothing was changed."))) }
+        }
+    }
+
+    // MARK: Clip looks → Visual Design groups (3.4.0)
+
+    /// A contact sheet of every clip (three frames each, as recorded) and a rough difference score
+    /// for every pair, so Claude can tell which clips were shot the same way.
+    private func mcpCompareClips(_ args: [String: Any], _ done: @escaping MCPReply) throws {
+        try mcpRequireIdle()
+        guard let project else { throw MCPError("Open a project first (open_project).") }
+        let included = mcpIncludedAssets
+        guard !included.isEmpty else { throw MCPError("This project has no clips in the Assets tab (or every clip is rejected).") }
+        let jobs = included.enumerated().map { i, a in
+            (number: i + 1, name: (a.path as NSString).lastPathComponent,
+             group: groupName(a.visualGroup ?? VisualGroup.arollID),
+             url: project.folder.appendingPathComponent(a.path), inPoint: a.inPoint, outPoint: a.outPoint)
+        }
+        Task { @MainActor in
+            var clips: [ClipLooks.Clip] = []
+            for j in jobs {
+                let url = j.url, i = j.inPoint, o = j.outPoint
+                let frames = await Task.detached(priority: .userInitiated) {
+                    await ClipLooks.frames(url: url, inPoint: i, outPoint: o)
+                }.value
+                clips.append(ClipLooks.Clip(number: j.number, name: j.name, group: j.group,
+                                            frames: frames, signature: ClipLooks.signature(frames)))
+            }
+            var pairs: [[String: Any]] = []
+            for a in clips.indices {
+                for b in clips.indices where b > a {
+                    pairs.append(["clips": [clips[a].number, clips[b].number],
+                                  "difference": MCP.r(ClipLooks.difference(clips[a].signature, clips[b].signature), 1)])
+                }
+            }
+            var out: [String: Any] = [
+                "clips": clips.map { c -> [String: Any] in
+                    let a = included[c.number - 1]
+                    var j: [String: Any] = ["clip": c.number, "file": c.name, "group": c.group,
+                                            "in": MCP.r(a.inPoint), "out": MCP.r(a.outPoint)]
+                    if c.frames.isEmpty { j["error"] = "Couldn't read any frames from this clip." }
+                    return j
+                },
+                "pairs": pairs,
+                "howToRead": "The sheet has one row per clip (number, file, current group), with frames at 10 %, 50 % and 90 % of its in/out, as recorded (no grade). Judge the look: camera angle, framing, lighting, background, colour and exposure. Ignore what the speaker is doing. difference is a rough second opinion (mean pixel difference of tiny thumbnails, 0–255): low means the same set-up, high means different, but trust your eyes over it. Clip 1 defines Default: clips that look like clip 1 stay in Default; each other look gets a new group named after what it looks like (e.g. \"Close-up – lamp light\"). Propose the groups with the reason, then stop for approval; set_clip_groups applies them."
+            ]
+            if let sheet = ClipLooks.sheet(clips) {
+                out["image"] = ["mimeType": "image/jpeg", "data": sheet.data.base64EncodedString(),
+                                "width": sheet.width, "height": sheet.height] as [String: Any]
+            }
+            done(.success(out))
+        }
+    }
+
+    /// Puts clips into Visual Design groups by name. The set with clip 1 is always Default; any other
+    /// name is an existing group or a new one. Clips left out stay where they are.
+    private func mcpSetClipGroups(_ args: [String: Any]) throws -> Any {
+        try mcpRequireIdle()
+        guard project != nil else { throw MCPError("Open a project first (open_project).") }
+        let included = mcpIncludedAssets
+        guard !included.isEmpty else { throw MCPError("This project has no clips in the Assets tab.") }
+        guard let list = args["groups"] as? [[String: Any]], !list.isEmpty else {
+            throw MCPError("groups is a list of {name, clips}, with clips numbered 1–\(included.count) (oldest first).")
+        }
+        var seen = Set<Int>()
+        var plan: [(name: String, clips: [Int])] = []
+        for g in list {
+            let name = (g["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let raw = g["clips"] as? [Any], !raw.isEmpty else { throw MCPError("Every group needs clips (numbers 1–\(included.count)).") }
+            let nums = try raw.map { v -> Int in
+                guard let n = MCP.num(v), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
+                    throw MCPError("Clips are numbers 1–\(included.count) (oldest first).")
+                }
+                guard seen.insert(Int(n)).inserted else { throw MCPError("Clip \(Int(n)) is in more than one group.") }
+                return Int(n)
+            }
+            if !nums.contains(1) {
+                guard !name.isEmpty else { throw MCPError("Every group but Default needs a name.") }
+                if name.caseInsensitiveCompare("Default") == .orderedSame {
+                    throw MCPError("Default is the group with clip 1 (the first clip defines it). Give clips \(nums.map(String.init).joined(separator: ", ")) their own group name, or put them in the same group as clip 1.")
+                }
+                if name.caseInsensitiveCompare(groupName(VisualGroup.brollID)) == .orderedSame {
+                    throw MCPError("The B-roll group is for B-roll shots. Pick another name.")
+                }
+            }
+            plan.append((name, nums))
+        }
+
+        var created: [String] = []
+        for g in plan {
+            let ids = g.clips.map { included[$0 - 1].id }
+            let target: String
+            if g.clips.contains(1) {
+                target = VisualGroup.arollID
+            } else if let existing = visualGroups.first(where: {
+                $0.id != VisualGroup.arollID && $0.id != VisualGroup.brollID && $0.name.caseInsensitiveCompare(g.name) == .orderedSame
+            }) {
+                target = existing.id
+            } else {
+                // Start from the look the first clip shows now, so nothing jumps until it's graded.
+                let first = included[g.clips[0] - 1]
+                let start = visualGroups.first(where: { $0.id == (first.visualGroup ?? VisualGroup.arollID) })?.look
+                let next = (visualGroups.map(\.colorIndex).max() ?? 0) + 1
+                let group = VisualGroup(id: UUID().uuidString, name: g.name, colorIndex: next, look: start)
+                visualGroups.append(group)
+                created.append(g.name)
+                target = group.id
+            }
+            moveAssets(ids, toGroup: target)
+        }
+        var out = mcpListGroups() as? [String: Any] ?? [:]
+        out["created"] = created
+        out["clips"] = mcpIncludedAssets.enumerated().map { i, a -> [String: Any] in
+            ["clip": i + 1, "file": (a.path as NSString).lastPathComponent, "group": groupName(a.visualGroup ?? VisualGroup.arollID)]
+        }
+        return out
+    }
+
     // MARK: set_trim
 
     private func mcpSetTrim(_ args: [String: Any]) throws -> Any {
@@ -1294,7 +1534,7 @@ extension PlayerWindowController {
         }
     }
 
-    // MARK: Motion graphics (step 8)
+    // MARK: Motion graphics (step 10)
 
     private func mcpGraphicsTemplates() -> [String: Any] {
         [
