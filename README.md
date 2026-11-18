@@ -19,7 +19,12 @@ You record yourself in one go, with as many retakes as you need. 1Shot helps you
 
 1Shot comes with a small helper that connects it to the [Claude desktop app](https://claude.ai/download)
 over MCP. Claude can then open your project, read the transcript, propose cuts, zooms, B-roll and
-graphics, and place them in the app — stopping for your approval after every step.
+graphics, and place them in the app. By default it asks before each step and asks for your
+feedback after it.
+
+The order of steps and when Claude stops is the **workflow**. To use your own, ask Claude to change
+it (it saves `~/Movies/1Shot/Workflow.md`), or write that file yourself. It replaces the built-in
+workflow completely, starting with the next conversation. Delete it to go back to the built-in one.
 
 How Claude edits is written down in plain-language **style guides** (`StyleGuides/`), which you can
 edit to match your own style. The guides that ship with the app use measurements from the author's

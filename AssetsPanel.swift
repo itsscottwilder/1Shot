@@ -21,6 +21,8 @@ final class AssetsPanel: NSVisualEffectView {
     var onRenameGroup: ((String, String) -> Void)?
     /// Right-click › Delete Group… (every group but Default).
     var onDeleteGroup: ((String) -> Void)?
+    /// The file behind an asset (its path is Media/-relative), for the details under a selected row.
+    var urlForAsset: ((AssetEntry) -> URL?)?
     /// Reused as-is: edits the currently selected asset's in/out (the window retargets its
     /// closures; the control itself doesn't know or care what it's trimming).
     let trimPanel = TrimPanel()
@@ -28,9 +30,16 @@ final class AssetsPanel: NSVisualEffectView {
     private let tableView = NSTableView()
     private var assets: [AssetEntry] = []
     private var selectedID: UUID?
+    /// The row showing its file details (3.5): the selected clip, until it's clicked again.
+    private var expandedID: UUID?
+    /// Set when a click selects a new row, so that click doesn't also collapse it.
+    private var selectionJustChanged = false
+    /// The clip list is as tall as its rows (3.5), so an open clip pushes Trim and the rest down.
+    private var listHeight: NSLayoutConstraint!
+    private var contentStack: NSStackView!
     private var groups: [(id: String, name: String, color: NSColor)] = []
     private let groupsStack = NSStackView()
-    private let groupsScroll = NSScrollView()
+    private let groupsScroll = PassThroughScrollView()
     private var groupsHeight: NSLayoutConstraint!
 
     init() {
@@ -67,13 +76,14 @@ final class AssetsPanel: NSVisualEffectView {
         tableView.menu = makeRowMenu()
         tableView.allowsMultipleSelection = true
         tableView.intercellSpacing = NSSize(width: 0, height: 2)
+        tableView.target = self
+        tableView.action = #selector(rowClicked)
 
-        let scroll = NSScrollView()
+        // Never scrolls (3.5): always as tall as its rows, so opening a clip pushes the clips
+        // below it, Trim and the rest down. The whole panel scrolls instead, if it ever must.
+        let scroll = PassThroughScrollView()
         scroll.documentView = tableView
-        scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
-        scroll.autohidesScrollers = true
-        scroll.scrollerStyle = .overlay
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         let buildButton = NSButton(title: "Build A-roll", target: self, action: #selector(buildClicked))
@@ -99,10 +109,7 @@ final class AssetsPanel: NSVisualEffectView {
         groupsDoc.translatesAutoresizingMaskIntoConstraints = false
         groupsDoc.addSubview(groupsStack)
         groupsScroll.documentView = groupsDoc
-        groupsScroll.hasVerticalScroller = true
         groupsScroll.drawsBackground = false
-        groupsScroll.autohidesScrollers = true
-        groupsScroll.scrollerStyle = .overlay
         groupsScroll.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             groupsStack.leadingAnchor.constraint(equalTo: groupsDoc.leadingAnchor),
@@ -129,16 +136,36 @@ final class AssetsPanel: NSVisualEffectView {
         stack.setCustomSpacing(16, after: trimPanel)
         stack.setCustomSpacing(16, after: groupsSection)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
+        contentStack = stack
+        listHeight = scroll.heightAnchor.constraint(equalToConstant: 8)
+
+        // The panel's contents scroll as one page, with no scroll bar, only if they're taller than the window.
+        let page = FlippedView()
+        page.translatesAutoresizingMaskIntoConstraints = false
+        page.addSubview(stack)
+        let pageScroll = NSScrollView()
+        pageScroll.documentView = page
+        pageScroll.drawsBackground = false
+        pageScroll.hasVerticalScroller = false
+        pageScroll.hasHorizontalScroller = false
+        pageScroll.verticalScrollElasticity = .none
+        pageScroll.horizontalScrollElasticity = .none
+        pageScroll.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(pageScroll)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 16),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -16),
+            pageScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            pageScroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            pageScroll.topAnchor.constraint(equalTo: topAnchor),
+            pageScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            page.widthAnchor.constraint(equalTo: pageScroll.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: page.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: page.bottomAnchor, constant: -16),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             subtitle.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scroll.heightAnchor.constraint(equalToConstant: 220),
+            listHeight,
             trimPanel.widthAnchor.constraint(equalTo: stack.widthAnchor),
             groupsSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
             buildButton.widthAnchor.constraint(equalTo: stack.widthAnchor)
@@ -156,6 +183,7 @@ final class AssetsPanel: NSVisualEffectView {
         self.selectedID = selectedID   // set before reloading, so the selection-changed guard below is a no-op
         tableView.reloadData()
         let keep = IndexSet(assets.indices.filter { multi.contains(assets[$0].id) })
+        if expandedID != selectedID || keep.count > 1 { expandedID = nil }
         if keep.count > 1 {
             tableView.selectRowIndexes(keep, byExtendingSelection: false)
             trimPanel.isHidden = true
@@ -167,6 +195,31 @@ final class AssetsPanel: NSVisualEffectView {
             tableView.deselectAll(nil)
             trimPanel.isHidden = true
         }
+        updateListHeight()
+    }
+
+    override func layout() {
+        super.layout()
+        updateListHeight()   // the window was resized, or the Trim panel came or went
+    }
+
+    /// Sizes the list to fit every row (an open clip's details included). It never scrolls.
+    private func updateListHeight(animated: Bool = false) {
+        guard let listHeight else { return }
+        // The table's own row positions, so its padding and row spacing are counted too.
+        let content = assets.isEmpty ? 0 : tableView.rect(ofRow: assets.count - 1).maxY + 4
+        let target = max(8, content)
+        guard abs(target - listHeight.constant) > 0.5 else { return }
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                ctx.allowsImplicitAnimation = true
+                listHeight.animator().constant = target
+                layoutSubtreeIfNeeded()
+            }
+        } else {
+            listHeight.constant = target
+        }
     }
 
     /// The Visual Design groups, for the row tags and the right-click menu.
@@ -174,6 +227,7 @@ final class AssetsPanel: NSVisualEffectView {
         groups = list
         tableView.reloadData()
         rebuildGroupList()
+        updateListHeight()
     }
 
     /// One row per group (B-roll's group isn't about assets, so it's left out): swatch, editable name, clip count.
@@ -191,7 +245,7 @@ final class AssetsPanel: NSVisualEffectView {
             groupsStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: groupsStack.widthAnchor).isActive = true
         }
-        groupsHeight.constant = min(132, max(26, CGFloat(shown.count) * 26))
+        groupsHeight.constant = max(26, CGFloat(shown.count) * 26)   // every group shows; no scrolling
     }
 
     private func makeRowMenu() -> NSMenu {
@@ -237,6 +291,60 @@ final class AssetsPanel: NSVisualEffectView {
     }
 
     @objc private func buildClicked() { onBuild?() }
+
+    // MARK: File details (3.5)
+
+    /// A second click on the selected row folds its details away; another click brings them back.
+    @objc private func rowClicked() {
+        if selectionJustChanged { selectionJustChanged = false; return }
+        let row = tableView.clickedRow
+        guard assets.indices.contains(row), tableView.selectedRowIndexes == [row] else { return }
+        setExpanded(expandedID == assets[row].id ? nil : assets[row].id)
+    }
+
+    private func setExpanded(_ id: UUID?) {
+        let old = expandedID.flatMap { e in assets.firstIndex { $0.id == e } }
+        expandedID = id
+        let new = id.flatMap { e in assets.firstIndex { $0.id == e } }
+        refreshRows([old, new].compactMap { $0 })
+        guard let id, let new, let url = urlForAsset?(assets[new]) else { return }
+        if ClipInfo.cached(url) == nil {
+            Task { @MainActor [weak self] in
+                _ = await ClipInfo.load(url)
+                guard let self, self.expandedID == id,
+                      let row = self.assets.firstIndex(where: { $0.id == id }) else { return }
+                self.refreshRows([row])
+            }
+        }
+    }
+
+    /// Re-fills and re-sizes rows (animated) and keeps an expanded row in view.
+    private func refreshRows(_ rows: [Int]) {
+        let set = IndexSet(rows.filter { assets.indices.contains($0) })
+        guard !set.isEmpty else { return }
+        for row in set { configureCell(tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? AssetRow, row: row) }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            tableView.noteHeightOfRows(withIndexesChanged: set)
+        }
+        updateListHeight(animated: true)
+    }
+
+    /// The details to show under a row, or nil when it isn't expanded.
+    private func details(forRow row: Int) -> ClipInfo? {
+        let asset = assets[row]
+        guard asset.id == expandedID, tableView.selectedRowIndexes.count <= 1 else { return nil }
+        guard let url = urlForAsset?(asset) else { return ClipInfo(lines: [("File", "Not found")]) }
+        return ClipInfo.cached(url) ?? ClipInfo(lines: [("", "Reading file…")])
+    }
+
+    private func configureCell(_ cell: AssetRow?, row: Int) {
+        guard let cell, assets.indices.contains(row) else { return }
+        let asset = assets[row]
+        let g = groups.first { $0.id == (asset.visualGroup ?? "aroll") }
+        cell.configure(asset, group: g.map { ($0.name, $0.color) }, details: details(forRow: row))
+        cell.onToggle = { [weak self] in self?.onToggleReject?(asset.id) }
+    }
 
     @objc private func removeClicked() {
         for id in menuTargets { onRemove?(id) }
@@ -296,30 +404,44 @@ extension AssetsPanel: NSTableViewDataSource, NSTableViewDelegate {
         let identifier = NSUserInterfaceItemIdentifier("AssetRow")
         let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? AssetRow) ?? AssetRow()
         cell.identifier = identifier
-        let asset = assets[row]
-        let g = groups.first { $0.id == (asset.visualGroup ?? "aroll") }
-        cell.configure(asset, group: g.map { ($0.name, $0.color) })
-        cell.onToggle = { [weak self] in self?.onToggleReject?(asset.id) }
+        configureCell(cell, row: row)
         return cell
     }
 
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard assets.indices.contains(row), let info = details(forRow: row) else { return AssetRow.baseHeight }
+        return AssetRow.baseHeight + AssetRow.detailsHeight(lines: info.lines.count)
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
-        if tableView.selectedRowIndexes.count > 1 { trimPanel.isHidden = true; return }   // ⌘-click: grouping only
+        if tableView.selectedRowIndexes.count > 1 {   // ⌘-click: grouping only
+            trimPanel.isHidden = true
+            if expandedID != nil { setExpanded(nil) }
+            return
+        }
         guard tableView.selectedRow >= 0, assets.indices.contains(tableView.selectedRow) else { return }
         let asset = assets[tableView.selectedRow]
         trimPanel.isHidden = false
         trimPanel.update(start: asset.inPoint, end: asset.outPoint)
         guard asset.id != selectedID else { return }   // a programmatic re-select from setAssets(); don't reload
         selectedID = asset.id
+        selectionJustChanged = true
+        setExpanded(asset.id)
         onSelect?(asset.id)
     }
 }
 
 /// One row: filename + a small in/out (or duration) readout, and a red/green reject toggle.
 final class AssetRow: NSTableCellView {
+    static let baseHeight: CGFloat = 36
+    private static let lineHeight: CGFloat = 15
+    static func detailsHeight(lines: Int) -> CGFloat { CGFloat(lines) * lineHeight + 10 }
+
     private let nameLabel = NSTextField(labelWithString: "")
     private let rangeLabel = NSTextField(labelWithString: "")
     private let toggleButton = NSButton()
+    /// File details (3.5), under the name when the row is expanded.
+    private let detailsLabel = NSTextField(labelWithString: "")
     var onToggle: (() -> Void)?
 
     override init(frame: NSRect) {
@@ -353,17 +475,32 @@ final class AssetRow: NSTableCellView {
         row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
+
+        detailsLabel.maximumNumberOfLines = 0
+        detailsLabel.lineBreakMode = .byWordWrapping   // each line truncates itself (paragraph style)
+        detailsLabel.isSelectable = true   // so a value can be copied
+        detailsLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailsLabel.isHidden = true
+        addSubview(detailsLabel)
         NSLayoutConstraint.activate([
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            row.centerYAnchor.constraint(equalTo: centerYAnchor)
+            // The name stays in the top 36 pt; the details open up below it.
+            row.centerYAnchor.constraint(equalTo: topAnchor, constant: AssetRow.baseHeight / 2),
+            detailsLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 26),
+            detailsLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            detailsLabel.topAnchor.constraint(equalTo: topAnchor, constant: AssetRow.baseHeight)
         ])
     }
+
+    /// NSTableCellView isn't flipped, so "top" would follow the bottom edge as the row grows.
+    override var isFlipped: Bool { true }
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func toggled() { onToggle?() }
 
-    func configure(_ asset: AssetEntry, group: (name: String, color: NSColor)? = nil) {
+    func configure(_ asset: AssetEntry, group: (name: String, color: NSColor)? = nil, details: ClipInfo? = nil) {
+        setDetails(details)
         nameLabel.stringValue = (asset.path as NSString).lastPathComponent
         let trimmed = asset.outPoint > asset.inPoint + 0.01 && (asset.inPoint > 0 || asset.outPoint < asset.duration - 0.01)
         rangeLabel.stringValue = trimmed
@@ -379,6 +516,27 @@ final class AssetRow: NSTableCellView {
         toggleButton.layer?.backgroundColor = (asset.rejected ? NSColor.systemRed : NSColor.systemGreen).cgColor
         toggleButton.toolTip = asset.rejected ? "Rejected — click to include" : "Included — click to reject"
     }
+
+    /// Two columns, labels in grey, one fixed-height line per detail (so the row height is exact).
+    private func setDetails(_ info: ClipInfo?) {
+        guard let info else { detailsLabel.isHidden = true; detailsLabel.stringValue = ""; return }
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .left, location: 84)]
+        para.minimumLineHeight = AssetRow.lineHeight
+        para.maximumLineHeight = AssetRow.lineHeight
+        para.lineBreakMode = .byTruncatingTail
+        let font = NSFont.systemFont(ofSize: 10.5)
+        let text = NSMutableAttributedString()
+        for (i, line) in info.lines.enumerated() {
+            if i > 0 { text.append(NSAttributedString(string: "\n")) }
+            text.append(NSAttributedString(string: line.label + "\t",
+                                           attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor, .paragraphStyle: para]))
+            text.append(NSAttributedString(string: line.value,
+                                           attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+        }
+        detailsLabel.attributedStringValue = text
+        detailsLabel.isHidden = false
+    }
 }
 
 
@@ -389,6 +547,20 @@ final class RightClickMenuField: NSTextField {
         guard currentEditor() == nil, let menu else { super.rightMouseDown(with: event); return }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
+}
+
+/// A scroll view that never scrolls or shows a scroll bar: it's always as tall as its contents,
+/// and hands the trackpad on to the panel around it.
+final class PassThroughScrollView: NSScrollView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        hasVerticalScroller = false
+        hasHorizontalScroller = false
+        verticalScrollElasticity = .none
+        horizontalScrollElasticity = .none
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func scrollWheel(with event: NSEvent) { nextResponder?.scrollWheel(with: event) }
 }
 
 /// An image that ignores the mouse, so clicks and right-clicks go to the view behind it.

@@ -10,7 +10,7 @@
 
 import Foundation
 
-let serverVersion = "2.10.0"
+let serverVersion = "2.11.0"
 let bundleID = "com.itsscottwilder.timecodeplayer"
 let supportPath = NSHomeDirectory() + "/Library/Application Support/1Shot"
 let socketPath = supportPath + "/mcp.sock"
@@ -466,6 +466,24 @@ let tool_read_style_guide: [String: Any] = [
     "annotations": ["readOnlyHint": true]
 ]
 
+let tool_read_workflow: [String: Any] = [
+    "name": "read_workflow",
+    "description": "The workflow you follow: the user's own (~/Movies/1Shot/Workflow.md) if they made one, else the built-in one. builtIn: true = the built-in one, e.g. as a starting point for the user's own.",
+    "inputSchema": ["type": "object", "properties": [
+        "builtIn": prop("boolean", "Show the built-in workflow even if the user has their own.")
+    ]],
+    "annotations": ["readOnlyHint": true]
+]
+
+let tool_save_workflow: [String: Any] = [
+    "name": "save_workflow",
+    "description": "Saves the user's own workflow to ~/Movies/1Shot/Workflow.md; it replaces the built-in workflow completely, in every new conversation. Only when the user asks to change how you work. Write the WHOLE workflow (start from read_workflow), show it to the user and get their OK before saving. The old file is kept as a backup. reset: true = back to the built-in workflow.",
+    "inputSchema": ["type": "object", "properties": [
+        "text": prop("string", "The whole workflow, as plain text or Markdown."),
+        "reset": prop("boolean", "Remove the user's workflow (kept as a backup) and use the built-in one.")
+    ]]
+]
+
 let tools: [[String: Any]] = [
     tool_status,
     tool_open_project,
@@ -492,13 +510,23 @@ let tools: [[String: Any]] = [
     tool_apply_graphics,
     tool_adjust_graphics,
     tool_graphics_style,
-    tool_read_style_guide
+    tool_read_style_guide,
+    tool_read_workflow,
+    tool_save_workflow
 ]
 
-let instructions = """
+// What every AI is told, whatever workflow the user follows.
+let instructionsHeader = """
 1Shot is a Mac app for preparing multi-take talking-head YouTube videos. You drive it with these tools. Several projects can be open at once, each in its own window: you work in the one your last open_project used (status shows its project and lists openProjects), so the user can switch windows without moving you.
 
-Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after every step. Never start the next step until they say so. Any step can be redone.
+All times are seconds on the ORIGINAL clip, the same clock as the transcript. If a tool says a dialog is open in the app, ask the user to close it.
+
+The user can define their own workflow. Below is the workflow to follow. If it differs from the "Pipeline step" numbers or the "stop for approval" notes in the tool descriptions, the workflow below wins. If the user asks to change how you work (order of steps, when to stop, steps to skip or add), offer to save it with save_workflow so it's used every time; read_workflow shows the current one.
+"""
+
+// The built-in workflow. A user's own ~/Movies/1Shot/Workflow.md replaces it completely.
+let defaultWorkflow = """
+Work the pipeline ONE STEP AT A TIME. Before each step, say which step is next and what you'll do, then wait for the user's go-ahead. After the step, show the result, ask for feedback and corrections, and wait. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.
 1 Clip in/out points: the first thing after the clips are in the Assets tab. find_dead_air measures the silence at the start and end of each clip and proposes an in/out for each. Show every clip with its dead air at start and end and the proposed in/out, flag anything odd (no voice found, a noise that may have been counted as sound), then STOP. The user approves or changes them; set_clip_trims applies the approved ones and rebuilds the A-roll. If the project has no Assets-tab clips (one video), skip this step.
 2 Visual Design groups: compare_clips shows every clip (three frames each, as recorded) and a rough difference score per pair. Clip 1 defines the Default group: clips that look like it (same camera angle, framing, lighting, background, colour) stay in Default; each different look gets its own new group, named after what it looks like (e.g. "Close-up – lamp light"). Show the proposed groups with the reason for each, then STOP. After approval, set_clip_groups applies them. Skip this step if the project has one clip.
@@ -512,8 +540,67 @@ Work the pipeline ONE STEP AT A TIME and STOP for the user's approval after ever
 10 Motion Graphics (playful style: elements animate beside the speaker; full-screen only for the 1–2 biggest points; about one plate every 15–20 s): graphics_templates first. From the transcript, choose spots and propose plates (template, words, the red word marked with *asterisks*, side opposite the speaker for overlays, builds on the words for bullets). Show them with graphics_preview and list each with its time and words; stop for the user's picks and edits. Then apply_graphics with only what they approved, and stop for approval. For size or position tweaks after that, use adjust_graphics (one plate) or graphics_style (all plates); both are instant. Charts and numbers use the user's real numbers only: ask, never make them up. Keep plates off the speaker's face unless it's a deliberate comedic beat. The app does not check the face: plates go exactly where side, scale and dx/dy put them, so pick the side away from the speaker and check the preview sheet; the user fine-tunes size and position in the Graphics tab. Always include a name plate: a lowerThird with the user's channel handle as title and their tagline as subtitle, in the first 10–15 s of the edited video. Ask the user for the handle and tagline if you don't know them; never guess.
 11 Export: not available in this version yet. The user exports with ⌘Y; its save sheet has a "Normalize loudness to −14 LUFS" checkbox (on by default).
 
-Read the style guide with read_style_guide before steps 6 to 10. All times are seconds on the ORIGINAL clip, the same clock as the transcript. If a tool says a dialog is open in the app, ask the user to close it.
+Read the style guide with read_style_guide before steps 6 to 10.
 """
+
+// MARK: - Workflow (the user's own, or the built-in one)
+
+let workflowPath = NSHomeDirectory() + "/Movies/1Shot/Workflow.md"
+
+/// The user's workflow if they have one (a non-empty Workflow.md), else nil.
+func customWorkflow() -> String? {
+    guard let text = try? String(contentsOfFile: workflowPath, encoding: .utf8) else { return nil }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+}
+
+/// Read when Claude connects, so a changed Workflow.md applies from the next conversation.
+func instructions() -> String {
+    if let custom = customWorkflow() {
+        return instructionsHeader + "\nWORKFLOW (the user's own, from \(workflowPath)):\n" + custom
+    }
+    return instructionsHeader + "\nWORKFLOW (built-in):\n" + defaultWorkflow
+}
+
+func readWorkflow(_ args: [String: Any]) throws -> Any {
+    if args["builtIn"] as? Bool == true {
+        return ["source": "built-in", "text": defaultWorkflow] as [String: Any]
+    }
+    if let custom = customWorkflow() {
+        return ["source": "custom", "file": workflowPath, "text": custom] as [String: Any]
+    }
+    return ["source": "built-in", "file": workflowPath, "note": "No Workflow.md yet, so the built-in workflow is used.", "text": defaultWorkflow] as [String: Any]
+}
+
+/// Keeps the previous Workflow.md as a dated backup before replacing or removing it.
+func backUpWorkflow() throws -> String? {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: workflowPath) else { return nil }
+    let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+    let backup = NSHomeDirectory() + "/Movies/1Shot/Workflow (backup \(stamp)).md.bak"
+    try fm.moveItem(atPath: workflowPath, toPath: backup)
+    return backup
+}
+
+func saveWorkflow(_ args: [String: Any]) throws -> Any {
+    if args["reset"] as? Bool == true {
+        let backup = try backUpWorkflow()
+        var answer: [String: Any] = ["source": "built-in", "note": "Back to the built-in workflow from the next conversation."]
+        if let backup { answer["backup"] = backup }
+        return answer
+    }
+    guard let text = args["text"] as? String,
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw HelperError("Give the whole workflow as text, or reset: true to go back to the built-in one.")
+    }
+    try FileManager.default.createDirectory(atPath: (workflowPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    let backup = try backUpWorkflow()
+    try text.write(toFile: workflowPath, atomically: true, encoding: .utf8)
+    var answer: [String: Any] = ["source": "custom", "file": workflowPath,
+                                 "note": "Saved. Follow it from now on in this conversation; new conversations get it automatically."]
+    if let backup { answer["backup"] = backup }
+    return answer
+}
 
 // MARK: - MCP (JSON-RPC 2.0 over stdio)
 
@@ -588,7 +675,13 @@ func callTool(_ id: Any, _ params: [String: Any]) {
         return
     }
     do {
-        let value = name == "read_style_guide" ? try readStyleGuide(args) : try App.call(name, args)
+        let value: Any
+        switch name {
+        case "read_style_guide": value = try readStyleGuide(args)
+        case "read_workflow": value = try readWorkflow(args)
+        case "save_workflow": value = try saveWorkflow(args)
+        default: value = try App.call(name, args)
+        }
         reply(id, result: ["content": toolContent(name, value), "isError": false])
     } catch {
         reply(id, result: ["content": [["type": "text", "text": error.localizedDescription]], "isError": true])
@@ -610,7 +703,7 @@ func handle(_ message: [String: Any]) {
             "protocolVersion": supported.contains(asked) ? asked : supported[0],
             "capabilities": ["tools": ["listChanged": false]],
             "serverInfo": ["name": "1shot", "title": "1Shot", "version": serverVersion],
-            "instructions": instructions
+            "instructions": instructions()
         ])
     case "ping":
         reply(id, result: [:])

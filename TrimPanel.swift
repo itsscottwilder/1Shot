@@ -48,6 +48,8 @@ final class TrimPanel: NSVisualEffectView {
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            // As tall as its contents (3.5): the Assets panel stacks it under a list that grows.
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
             inRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             outRow.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])

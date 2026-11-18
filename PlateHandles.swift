@@ -227,6 +227,7 @@ extension PlayerWindowController {
         guard let i = graphicsPanel.selectedRow, graphics.indices.contains(i),
               let (base, pivot) = platePlacement(graphics[i]) else { return }
         player?.pause()
+        refreshStats = RefreshStats()
         let p = graphics[i]
         let s = CGFloat(p.scale ?? 1), dx = CGFloat(p.dx ?? 0), dy = CGFloat(p.dy ?? 0)
         let box = PlateDrawing.placed(base, pivot: pivot, scale: s, dx: dx, dy: dy)
@@ -285,6 +286,7 @@ extension PlayerWindowController {
         list[d.index].dx = abs(d.newDX) > 0.5 ? Double(d.newDX).rounded() : nil
         list[d.index].dy = abs(d.newDY) > 0.5 ? Double(d.newDY).rounded() : nil
         setGraphics(list)                                   // redraws the plate sharp at its new size
+        logRefreshStatsSoon("graphic drag")
         if let i = graphics.firstIndex(where: { $0.id == d.id }) {
             graphicsPanel.select(i)                         // also brings the Size/X/Y sliders up to date
         }

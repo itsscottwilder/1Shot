@@ -269,6 +269,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         assetsPanel.onMoveToGroup = { [weak self] ids, group in self?.moveAssets(ids, toGroup: group) }
         assetsPanel.onRenameGroup = { [weak self] id, name in self?.renameGroup(id, to: name) }
         assetsPanel.onDeleteGroup = { [weak self] id in self?.confirmDeleteGroup(id) }
+        assetsPanel.urlForAsset = { [weak self] entry in self?.project?.folder.appendingPathComponent(entry.path) }
         assetsPanel.trimPanel.onSetIn = { [weak self] seconds in self?.setTrimFromPanel(start: seconds, end: nil) }
         assetsPanel.trimPanel.onSetOut = { [weak self] seconds in self?.setTrimFromPanel(start: nil, end: seconds) }
         assetsPanel.trimPanel.onSetInAtPlayhead = { [weak self] in
@@ -1088,19 +1089,79 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Color
 
-    /// Show a slider change right away, even while paused (re-renders the current frame).
+    /// Show a change right away while paused (re-renders the current frame).
+    ///
+    /// 3.5: one refresh at a time, and the latest one always lands. The old version handed
+    /// AVFoundation a new composition and hoped; on slower Macs (MacBook Air) a re-render could
+    /// be skipped while another was drawing, leaving a moved graphic in its old place. Now each
+    /// refresh waits until the compositor really starts a new frame, retries if it doesn't (and
+    /// finally re-seeks to the same time, which always draws), and runs once more if anything
+    /// changed in the meantime. Problems are logged as "1Shot: refresh: …".
     func refreshFrame() {
-        guard let p = player, p.timeControlStatus == .paused, !refreshPending else { return }
+        guard let p = player else { return }
+        // Playing frames draw themselves. (Was `timeControlStatus == .paused`, which also skipped
+        // refreshes while the player was "waiting" — paused, but buffering — so nothing redrew.)
+        guard p.rate == 0 else { return }
+        refreshStats.requests += 1
+        refreshWanted = true
+        guard !refreshPending else { return }      // the one in flight runs again when it's done
         refreshPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-            guard let self, let p = self.player, let item = p.currentItem else { return }
-            self.refreshPending = false
-            // Handing the item a fresh copy of the composition makes AVFoundation
-            // re-render the paused frame with the new settings.
-            if let copy = self.videoComposition?.mutableCopy() as? AVVideoComposition {
-                item.videoComposition = copy
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in self?.runRefresh(attempt: 1) }
+    }
+
+    /// Counts for the "1Shot: refresh:" log line written after each graphic or B-roll drag.
+    struct RefreshStats { var requests = 0, renders = 0, retries = 0, reseeks = 0, failures = 0 }
+    var refreshStats = RefreshStats()
+    private var refreshWanted = false
+
+    /// Logs once the last refresh of a drag has had time to land (or fail).
+    func logRefreshStatsSoon(_ what: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.logRefreshStats(what) }
+    }
+
+    func logRefreshStats(_ what: String) {
+        let s = refreshStats
+        NSLog("1Shot: refresh: \(what): \(s.requests) requests, \(s.renders) frames drawn, \(s.retries) retries, \(s.reseeks) re-seeks, \(s.failures) never drew"
+              + (player.map { ", player \($0.timeControlStatus.rawValue) rate \($0.rate)" } ?? ""))
+        refreshStats = RefreshStats()
+    }
+
+    private func runRefresh(attempt: Int) {
+        guard let p = player, let item = p.currentItem else { refreshPending = false; return }
+        refreshWanted = false
+        let before = grade.frameStats.graded
+        if attempt <= 2 {
+            // Handing the item a fresh copy of the composition makes AVFoundation re-render the paused frame.
+            if let copy = videoComposition?.mutableCopy() as? AVVideoComposition { item.videoComposition = copy }
+        } else {
+            refreshStats.reseeks += 1
+            p.seek(to: p.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        let started = CACurrentMediaTime()
+        func check() {
+            guard let p = self.player, p.currentItem === item else { self.refreshPending = false; return }
+            if self.grade.frameStats.graded != before {               // a new frame is being drawn
+                self.refreshStats.renders += 1
+                if self.refreshWanted, p.rate == 0 { self.runRefresh(attempt: 1) } else { self.refreshPending = false }
+                return
+            }
+            if CACurrentMediaTime() - started < 0.25 {                 // give it up to a quarter second
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { check() }
+                return
+            }
+            guard p.rate == 0 else { self.refreshPending = false; return }   // started playing: frames draw anyway
+            if attempt < 3 {
+                self.refreshStats.retries += 1
+                NSLog("1Shot: refresh: no new frame after 0.25 s (try \(attempt)); \(attempt == 1 ? "trying again" : "re-seeking")")
+                self.runRefresh(attempt: attempt + 1)
+            } else {
+                self.refreshStats.failures += 1
+                NSLog("1Shot: refresh: gave up, the frame never redrew (player \(p.timeControlStatus.rawValue), item \(item.status.rawValue))")
+                self.refreshPending = false
+                if self.refreshWanted { self.refreshFrame() }
             }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { check() }
     }
 
     private func updateHistogram() {

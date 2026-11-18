@@ -72,6 +72,7 @@ extension PlayerWindowController {
     private func beginBrollDrag(_ grab: PlateHandlesView.Grab, at point: NSPoint) {
         guard let i = brollPanel.selectedRow, broll.indices.contains(i) else { return }
         player?.pause()
+        refreshStats = RefreshStats()
         let box = brollBox(broll[i])
         brollDrag = BrollDrag(index: i, id: broll[i].id, grab: grab, start: point, box: box, newBox: box)
     }
@@ -130,6 +131,7 @@ extension PlayerWindowController {
             list[d.index].pipScale = nil; list[d.index].pipX = nil; list[d.index].pipY = nil
         }
         setBroll(list)
+        logRefreshStatsSoon("B-roll drag")
         if let i = broll.firstIndex(where: { $0.id == d.id }) { brollPanel.select(i) }
         saveProject()
         updateBrollHandles()
