@@ -8,6 +8,11 @@ import AVFoundation
 /// Zoom and pan sliders for the selected B-roll shot (B-roll tab, under the list).
 final class BrollFramingControls: NSView {
     var onChange: ((Double, Double, Double) -> Void)?
+    var onPushChange: ((Bool) -> Void)?
+    var onFitChange: ((Bool) -> Void)?
+    var onReset: (() -> Void)?
+    private let fit = NSButton(checkboxWithTitle: "Show whole picture (no crop)", target: nil, action: nil)
+    private let push = NSButton(checkboxWithTitle: "Slow push-in (photos)", target: nil, action: nil)
     private let zoom = NSSlider(value: 1, minValue: 1, maxValue: 3, target: nil, action: nil)
     private let panX = NSSlider(value: 0, minValue: -1, maxValue: 1, target: nil, action: nil)
     private let panY = NSSlider(value: 0, minValue: -1, maxValue: 1, target: nil, action: nil)
@@ -26,6 +31,16 @@ final class BrollFramingControls: NSView {
         reset.controlSize = .small
         reset.target = self
         reset.action = #selector(resetClicked)
+        push.controlSize = .small
+        push.font = .systemFont(ofSize: 11)
+        push.target = self
+        push.action = #selector(pushClicked)
+        fit.controlSize = .small
+        fit.font = .systemFont(ofSize: 11)
+        fit.target = self
+        fit.action = #selector(fitClicked)
+        fit.toolTip = "On: the shot keeps its own shape (e.g. square), uncropped, with you showing around it and through any transparent parts of a PNG. Off: it fills the 16:9 frame and the edges are cropped."
+        push.toolTip = "Off: the photo stays still. On: it slowly zooms in (100% → 108%) while on screen."
         for s in [zoom, panX, panY] {
             s.target = self
             s.action = #selector(changed)
@@ -36,7 +51,8 @@ final class BrollFramingControls: NSView {
         let stack = NSStackView(views: [header, hint,
                                         row("Zoom", zoom, zoomValue),
                                         row("Pan ←→", panX, nil),
-                                        row("Pan ↑↓", panY, nil)])
+                                        row("Pan ↑↓", panY, nil),
+                                        fit, push])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -68,6 +84,10 @@ final class BrollFramingControls: NSView {
         let on = c != nil
         [zoom, panX, panY, reset].forEach { $0.isEnabled = on }
         hint.isHidden = on
+        push.isEnabled = c?.isPhoto == true
+        fit.isEnabled = on
+        fit.state = c?.showsWhole == true ? .on : .off
+        push.state = c?.isPhoto == true && c?.push == true ? .on : .off
         zoom.doubleValue = c?.zoom ?? 1
         panX.doubleValue = c?.panX ?? 0
         panY.doubleValue = c?.panY ?? 0
@@ -79,9 +99,13 @@ final class BrollFramingControls: NSView {
         onChange?(zoom.doubleValue, panX.doubleValue, panY.doubleValue)
     }
 
+    @objc private func fitClicked() { onFitChange?(fit.state == .on) }
+    @objc private func pushClicked() { onPushChange?(push.state == .on) }
+
     @objc private func resetClicked() {
         zoom.doubleValue = 1; panX.doubleValue = 0; panY.doubleValue = 0
-        changed()
+        zoomValue.stringValue = "1.00×"
+        if let onReset { onReset() } else { changed() }
     }
 }
 
@@ -255,6 +279,33 @@ extension PlayerWindowController {
         brollFraming.onChange = { [weak self] zoom, panX, panY in
             guard let self, let i = self.brollPanel.selectedRow, self.broll.indices.contains(i) else { return }
             self.setBrollFraming(at: i, zoom: zoom, panX: panX, panY: panY)
+        }
+        brollFraming.onReset = { [weak self] in
+            guard let self, let i = self.brollPanel.selectedRow, self.broll.indices.contains(i) else { return }
+            var list = self.broll
+            list[i].zoom = nil; list[i].panX = nil; list[i].panY = nil
+            list[i].pipScale = nil; list[i].pipX = nil; list[i].pipY = nil; list[i].rotation = nil
+            self.setBroll(list)
+            self.brollPanel.select(i)
+            self.updateBrollHandles()
+        }
+        brollFraming.onFitChange = { [weak self] on in
+            guard let self, let i = self.brollPanel.selectedRow, self.broll.indices.contains(i) else { return }
+            var list = self.broll
+            list[i].fit = on == list[i].isPhoto ? nil : on
+            self.setBroll(list)
+            if self.trimBar.playhead < list[i].at || self.trimBar.playhead > self.clipTimeFor(edited: self.edited(list[i].at) + list[i].length) {
+                self.jumpTo(list[i].at + min(1, list[i].length / 2))
+            }
+        }
+        brollFraming.onPushChange = { [weak self] on in
+            guard let self, let i = self.brollPanel.selectedRow, self.broll.indices.contains(i) else { return }
+            var list = self.broll
+            list[i].push = on ? true : nil
+            self.setBroll(list)
+            if self.trimBar.playhead < list[i].at || self.trimBar.playhead > self.clipTimeFor(edited: self.edited(list[i].at) + list[i].length) {
+                self.jumpTo(list[i].at + min(1, list[i].length / 2))
+            }
         }
 
         // Graphics

@@ -318,6 +318,7 @@ final class VideoExporter {
 
             // ---- Audio pump: decode → plugin chain → AAC
 
+            let volume = rack.volumeMap   // A1 section levels (3.7.0)
             group.enter()
             let finishAudio = {
                 state.audioFinished = true
@@ -335,6 +336,7 @@ final class VideoExporter {
                         if let sample = audioOut.copyNextSampleBuffer() {
                             if var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) {
                                 let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                                if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
                                 if let fadeEnd = self.source.fadeEnd {
                                     AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd)
                                 }

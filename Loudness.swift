@@ -216,6 +216,7 @@ enum LoudnessScan {
                                 chunk: AVAudioFrameCount, latency: AVAudioFramePosition,
                                 start: Double, end: Double, cuts: [Cut], fadeEnd: Double?,
                                 isCancelled: () -> Bool, progress: ((Double) -> Void)?) throws -> LUFSMeter.Reading {
+        let volume = rack.volumeMap   // A1 section levels (3.7.0)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: AudioFeeder.readerSettings(for: format))
         output.alwaysCopiesSampleData = false
@@ -250,6 +251,7 @@ enum LoudnessScan {
                 guard let sample = output.copyNextSampleBuffer() else { sourceEnded = true; break }
                 guard var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) else { continue }
                 let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
                 if let fadeEnd { AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd) }
                 if !normalized.isEmpty {
                     guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { continue }

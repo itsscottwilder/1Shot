@@ -24,6 +24,11 @@ struct BrollClip: Codable, Equatable {
     var credit: String? = nil
     var reason: String? = nil
     var words: String? = nil
+    // Generated B-roll (3.6): made by an AI service or by Claude, not stock. `generated` lets a shot
+    // come from a `file` (or any `url`) despite the stock-only policy; `prompt` is what made it.
+    var generated: Bool? = nil
+    var prompt: String? = nil
+    var isGenerated: Bool { generated == true }
     // Framing (3.2): zoom into the shot and pan across it. 1 = fill the frame; panX/panY −1…1
     // pick which part shows once zoomed in (−1 = left/top edge, 0 = centre, +1 = right/bottom).
     var zoom: Double? = nil
@@ -36,6 +41,17 @@ struct BrollClip: Codable, Equatable {
     var pipX: Double? = nil
     var pipY: Double? = nil
     var isPiP: Bool { (pipScale ?? 1) < 0.999 }
+    // Photos (3.7.1): still by default; push = true gives the slow 100→108% push-in.
+    var push: Bool? = nil
+    // Aspect (3.7.2): fit = show the whole picture at its own shape, uncropped, with the talking
+    // head showing around it (and through a PNG's transparent parts); false = fill the frame
+    // (crop). nil = photos fit, videos fill.
+    var fit: Bool? = nil
+    var showsWhole: Bool { fit ?? isPhoto }
+    // Free placement of a whole picture (3.8.0), dragged on the video: for a whole-picture shot,
+    // pipScale is its size (1 = as big as fits the frame), pipX/pipY its centre in the 1920×1080
+    // design (y down) and rotation its turn in degrees, clockwise. No box or shadow is added.
+    var rotation: Double? = nil
 
     var isPhoto: Bool { kind == "photo" }
 }
@@ -43,7 +59,7 @@ struct BrollClip: Codable, Equatable {
 enum BrollList {
     static let defaultPhotoLength = 4.0
     static let defaultVideoLength = 5.0
-    static let photoPush = 0.08     // photos ease from 100% to 108% while on screen
+    static let photoPush = 0.08     // photos with push on ease from 100% to 108% while on screen
 
     enum ParseError: LocalizedError {
         case notFound
@@ -58,7 +74,9 @@ enum BrollList {
             let url: String?; let search: String?; let pixabayId: Int?
             let credit: String?; let reason: String?; let words: String?
             let zoom: Double?; let panX: Double?; let panY: Double?
-            let pipScale: Double?; let pipX: Double?; let pipY: Double?
+            let pipScale: Double?; let pipX: Double?; let pipY: Double?; let rotation: Double?
+            let generated: Bool?; let prompt: String?
+            let push: Bool?; let fit: Bool?
         }
         struct Wrapper: Decodable { let broll: [Item] }
         var candidates = [text]
@@ -67,13 +85,16 @@ enum BrollList {
             guard let data = c.data(using: .utf8), let w = try? JSONDecoder().decode(Wrapper.self, from: data) else { continue }
             return w.broll.map { i in
                 let guess = i.file.map { isPhotoFile(URL(fileURLWithPath: $0)) ? "photo" : "video" }
+                    ?? i.url.flatMap { URL(string: $0) }.flatMap { isVideoFile($0) ? "video" : nil }
                 let photo = (i.kind ?? guess ?? (i.search != nil || i.pixabayId != nil ? "video" : "photo")) == "photo"
                 return BrollClip(at: i.at, length: i.length ?? (photo ? defaultPhotoLength : defaultVideoLength),
                                  kind: photo ? "photo" : "video", sourceIn: i.sourceIn,
                                  libraryFile: i.file, url: i.url, search: i.search, pixabayId: i.pixabayId,
                                  credit: i.credit, reason: i.reason, words: i.words,
+                                 generated: i.generated, prompt: i.prompt,
                                  zoom: i.zoom, panX: i.panX, panY: i.panY,
-                                 pipScale: i.pipScale, pipX: i.pipX, pipY: i.pipY)
+                                 pipScale: i.pipScale, pipX: i.pipX, pipY: i.pipY,
+                                 push: i.push == true ? true : nil, fit: i.fit, rotation: i.rotation)
             }
         }
         throw ParseError.notFound
@@ -82,12 +103,18 @@ enum BrollList {
     static func isPhotoFile(_ url: URL) -> Bool {
         ["jpg", "jpeg", "png", "heic", "tif", "tiff", "webp"].contains(url.pathExtension.lowercased())
     }
+
+    static func isVideoFile(_ url: URL) -> Bool {
+        ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased())
+    }
 }
 
 /// Draws B-roll frames for the color pipeline (thread-safe; caches decoders and photos).
 final class BrollRenderer {
     struct Shot {
         let url: URL; let at: Double; let length: Double; let sourceIn: Double; let photo: Bool
+        var push = false              // photos only: the slow push-in
+        var fit = false               // whole picture at its own shape, blurred copy behind
         var zoom: Double = 1; var panX: Double = 0; var panY: Double = 0
         var group: String? = nil      // Visual Design group (3.2)
         var id: String = ""
@@ -95,7 +122,7 @@ final class BrollRenderer {
     }
 
     /// A picture-in-picture box: size (0…1 of the frame) and centre in the 1920×1080 design (y down).
-    struct PiP { var scale: Double; var x: Double; var y: Double }
+    struct PiP { var scale: Double; var x: Double; var y: Double; var rotation: Double = 0 }
 
     /// While a shot's box is dragged on screen: its live size/position, until the drag ends.
     private var _live: (id: String, pip: PiP?)?
@@ -129,9 +156,27 @@ final class BrollRenderer {
             let into = edited - startEdited
             guard into >= 0, into < s.length else { continue }
             guard var img = s.photo ? photo(s.url) : frame(s.url, at: s.sourceIn + into, extent: extent) else { return nil }
-            var k = max(extent.width / img.extent.width, extent.height / img.extent.height)   // fill the frame
-            if s.photo { k *= CGFloat(1 + BrollList.photoPush * min(1, into / max(0.1, s.length))) }
+            let kFill = max(extent.width / img.extent.width, extent.height / img.extent.height)   // fill the frame
+            let kFit = min(extent.width / img.extent.width, extent.height / img.extent.height)    // whole picture
+            var k = s.fit ? kFit : kFill
+            if s.photo && s.push { k *= CGFloat(1 + BrollList.photoPush * min(1, into / max(0.1, s.length))) }
             k *= CGFloat(max(1, s.zoom))
+            let pip = live.flatMap { $0.id == s.id ? $0.pip : nil } ?? (live?.id == s.id ? nil : s.pip)
+            if s.fit {
+                // Whole picture, placed freely: size, centre and turn from its placement (3.8.0).
+                let W = extent.width, H = extent.height
+                let kd = min(W / 1920, H / 1080)
+                let dx = (W - 1920 * kd) / 2, dy = (H - 1080 * kd) / 2
+                let cx = extent.minX + dx + CGFloat(pip?.x ?? 960) * kd
+                let cy = extent.minY + H - dy - CGFloat(pip?.y ?? 540) * kd
+                k *= CGFloat(max(0.02, pip?.scale ?? 1))
+                let turn = -CGFloat(pip?.rotation ?? 0) * .pi / 180     // clockwise on screen; CIImage y runs up
+                img = img.transformed(by: CGAffineTransform(translationX: -img.extent.midX, y: -img.extent.midY)
+                    .concatenating(CGAffineTransform(scaleX: k, y: k))
+                    .concatenating(CGAffineTransform(rotationAngle: turn))
+                    .concatenating(CGAffineTransform(translationX: cx, y: cy)))
+                return (img.cropped(to: extent), s.group, nil)
+            }
             // Pan: slide the zoomed picture so the chosen part shows, never past its edges.
             let spareX = max(0, img.extent.width * k - extent.width) / 2
             let spareY = max(0, img.extent.height * k - extent.height) / 2
@@ -140,7 +185,6 @@ final class BrollRenderer {
             img = img.transformed(by: CGAffineTransform(translationX: -img.extent.midX, y: -img.extent.midY)
                 .concatenating(CGAffineTransform(scaleX: k, y: k))
                 .concatenating(CGAffineTransform(translationX: extent.midX + ox, y: extent.midY + oy)))
-            let pip = live.flatMap { $0.id == s.id ? $0.pip : nil } ?? (live?.id == s.id ? nil : s.pip)
             return (img.cropped(to: extent), s.group, pip)
         }
         return nil
@@ -495,7 +539,7 @@ final class SettingsWindow: NSObject {
 enum SharedBrollLibrary {
     struct Item: Codable {
         var file: String
-        var source: String          // "pixabay" or "url"
+        var source: String          // "pixabay", "url" or "generated"
         var pixabayId: Int?
         var url: String?
         var page: String?
@@ -503,6 +547,7 @@ enum SharedBrollLibrary {
         var words: String?
         var project: String?
         var added: String
+        var prompt: String? = nil   // generated clips: what made it
     }
 
     static var folder: URL { Project.defaultLocation.appendingPathComponent("B-roll Library", isDirectory: true) }
@@ -519,6 +564,7 @@ enum SharedBrollLibrary {
         let match: Item?
         if let id = clip.pixabayId { match = items.first { $0.pixabayId == id } }
         else if let u = clip.url { match = items.first { $0.url == u } }
+        else if clip.isGenerated, let f = clip.libraryFile { match = items.first { $0.url == f } }
         else { match = nil }
         guard let match else { return nil }
         let url = folder.appendingPathComponent(match.file)
@@ -529,7 +575,7 @@ enum SharedBrollLibrary {
     /// copy is what plays, so the edit never depends on the library.
     @discardableResult
     static func add(_ source: URL, clip: BrollClip, project: String?) -> Bool {
-        guard clip.pixabayId != nil || clip.url != nil else { return false }
+        guard clip.pixabayId != nil || clip.url != nil || clip.isGenerated else { return false }
         if item(for: clip) != nil { return true }
         let fm = FileManager.default
         do {
@@ -543,11 +589,11 @@ enum SharedBrollLibrary {
             try fm.copyItem(at: source, to: target)
             var items = load()
             items.append(Item(file: target.lastPathComponent,
-                              source: clip.pixabayId != nil ? "pixabay" : "url",
-                              pixabayId: clip.pixabayId, url: clip.url,
+                              source: clip.pixabayId != nil ? "pixabay" : clip.isGenerated ? "generated" : "url",
+                              pixabayId: clip.pixabayId, url: clip.url ?? (clip.isGenerated ? clip.libraryFile : nil),
                               page: clip.pixabayId.map { "https://pixabay.com/videos/id-\($0)/" } ?? clip.url,
                               credit: clip.credit, words: clip.words, project: project,
-                              added: ISO8601DateFormatter().string(from: Date())))
+                              added: ISO8601DateFormatter().string(from: Date()), prompt: clip.prompt))
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(items).write(to: indexURL, options: .atomic)

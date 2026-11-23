@@ -14,6 +14,10 @@ final class AssetsPanel: NSVisualEffectView {
     var onToggleReject: ((UUID) -> Void)?
     var onRemove: ((UUID) -> Void)?
     var onBuild: (() -> Void)?
+    /// Drag a row up/down, or right-click › Move Up / Move Down (3.6.1): the whole list, in its new
+    /// order. This order is the A-roll order.
+    var onReorder: (([UUID]) -> Void)?
+    static let rowDragType = NSPasteboard.PasteboardType("com.1shot.asset-row")
     /// Right-click › Move to New Visual Design Group / Move to Visual Design Group › (every
     /// selected clip when the clicked row is part of a ⌘-click selection).
     var onMoveToNewGroup: (([UUID]) -> Void)?
@@ -52,7 +56,7 @@ final class AssetsPanel: NSVisualEffectView {
 
         let title = NSTextField(labelWithString: "Assets")
         title.font = .boldSystemFont(ofSize: 15)
-        let subtitle = NSTextField(labelWithString: "Oldest to newest — drag clips in, or Import…")
+        let subtitle = NSTextField(labelWithString: "Drag clips in, or Import… Drag a clip up or down (or right-click › Move Up) to set the A-roll order.")
         subtitle.font = .systemFont(ofSize: 11)
         subtitle.textColor = .secondaryLabelColor
         subtitle.lineBreakMode = .byWordWrapping
@@ -78,6 +82,9 @@ final class AssetsPanel: NSVisualEffectView {
         tableView.intercellSpacing = NSSize(width: 0, height: 2)
         tableView.target = self
         tableView.action = #selector(rowClicked)
+        tableView.registerForDraggedTypes([AssetsPanel.rowDragType])
+        tableView.setDraggingSourceOperationMask(.move, forLocal: true)
+        tableView.draggingDestinationFeedbackStyle = .gap
 
         // Never scrolls (3.5): always as tall as its rows, so opening a clip pushes the clips
         // below it, Trim and the rest down. The whole panel scrolls instead, if it ever must.
@@ -90,7 +97,7 @@ final class AssetsPanel: NSVisualEffectView {
         buildButton.bezelStyle = .rounded
         buildButton.controlSize = .regular
         buildButton.refusesFirstResponder = true
-        buildButton.toolTip = "Assembles every non-rejected clip, oldest to newest, each trimmed to its own in/out"
+        buildButton.toolTip = "Assembles every non-rejected clip, top to bottom, each trimmed to its own in/out"
 
         trimPanel.isHidden = true
         trimPanel.translatesAutoresizingMaskIntoConstraints = false
@@ -346,6 +353,30 @@ final class AssetsPanel: NSVisualEffectView {
         cell.onToggle = { [weak self] in self?.onToggleReject?(asset.id) }
     }
 
+    /// Moves the right-clicked clips (keeping their order) up or down by one place.
+    private func move(_ ids: [UUID], by step: Int) {
+        var order = assets.map(\.id)
+        let moving = Set(ids)
+        let indices = order.indices.filter { moving.contains(order[$0]) }
+        for i in (step < 0 ? indices : indices.reversed()) {
+            let j = i + step
+            guard order.indices.contains(j), !moving.contains(order[j]) else { continue }
+            order.swapAt(i, j)
+        }
+        onReorder?(order)
+    }
+
+    private func moveToEnd(_ ids: [UUID], top: Bool) {
+        let moving = assets.map(\.id).filter { ids.contains($0) }
+        let rest = assets.map(\.id).filter { !ids.contains($0) }
+        onReorder?(top ? moving + rest : rest + moving)
+    }
+
+    @objc private func moveUpClicked() { move(menuTargets, by: -1) }
+    @objc private func moveDownClicked() { move(menuTargets, by: 1) }
+    @objc private func moveTopClicked() { moveToEnd(menuTargets, top: true) }
+    @objc private func moveBottomClicked() { moveToEnd(menuTargets, top: false) }
+
     @objc private func removeClicked() {
         for id in menuTargets { onRemove?(id) }
     }
@@ -391,6 +422,13 @@ extension AssetsPanel: NSMenuDelegate {
             menu.addItem(move)
         }
         menu.addItem(.separator())
+        for (title, sel) in [("Move Up", #selector(moveUpClicked)), ("Move Down", #selector(moveDownClicked)),
+                             ("Move to Top", #selector(moveTopClicked)), ("Move to Bottom", #selector(moveBottomClicked))] {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         let remove = NSMenuItem(title: many ? "Remove \(ids.count) Clips" : "Remove", action: #selector(removeClicked), keyEquivalent: "")
         remove.target = self
         menu.addItem(remove)
@@ -399,6 +437,33 @@ extension AssetsPanel: NSMenuDelegate {
 
 extension AssetsPanel: NSTableViewDataSource, NSTableViewDelegate {
     func numberOfRows(in tableView: NSTableView) -> Int { assets.count }
+
+    // Drag a row to reorder (3.6.1).
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard assets.indices.contains(row) else { return nil }
+        let item = NSPasteboardItem()
+        item.setString(assets[row].id.uuidString, forType: AssetsPanel.rowDragType)
+        return item
+    }
+
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
+                   proposedDropOperation op: NSTableView.DropOperation) -> NSDragOperation {
+        guard (info.draggingSource as? NSTableView) === tableView else { return [] }
+        if op == .on { tableView.setDropRow(row, dropOperation: .above) }
+        return .move
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
+                   dropOperation: NSTableView.DropOperation) -> Bool {
+        let ids = (info.draggingPasteboard.pasteboardItems ?? [])
+            .compactMap { $0.string(forType: AssetsPanel.rowDragType) }.compactMap(UUID.init(uuidString:))
+        guard !ids.isEmpty else { return false }
+        let moving = assets.map(\.id).filter { ids.contains($0) }
+        let before = assets.prefix(row).map(\.id).filter { !ids.contains($0) }
+        let after = assets.dropFirst(row).map(\.id).filter { !ids.contains($0) }
+        onReorder?(before + moving + after)
+        return true
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let identifier = NSUserInterfaceItemIdentifier("AssetRow")

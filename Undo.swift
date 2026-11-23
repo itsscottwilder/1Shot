@@ -21,6 +21,7 @@ struct EditState: Equatable {
     var broll: [BrollClip]
     var graphics: [GraphicPlate] = []
     var trim: [Double]?            // [in, out] on the original clip; nil = not trimmed
+    var volume = VolumeMap()       // A1 sections (3.7.0)
 
     /// The parts that count as edits (see the note at the top).
     fileprivate var comparable: EditState {
@@ -39,7 +40,7 @@ struct EditState: Equatable {
     static func == (a: EditState, b: EditState) -> Bool {
         let x = a.plain, y = b.plain
         return x.color == y.color && x.audio == y.audio && x.cuts == y.cuts &&
-            x.zooms == y.zooms && x.broll == y.broll && x.graphics == y.graphics && x.trim == y.trim
+            x.zooms == y.zooms && x.broll == y.broll && x.graphics == y.graphics && x.trim == y.trim && x.volume == y.volume
     }
 
     /// Field-by-field equality without the custom == above (which would call itself).
@@ -51,11 +52,12 @@ struct EditState: Equatable {
         let broll: [BrollClip]
         let graphics: [GraphicPlate]
         let trim: [Double]?
+        let volume: VolumeMap
     }
 
     private var plain: Plain {
         let c = comparable
-        return Plain(color: c.color, audio: c.audio, cuts: c.cuts, zooms: c.zooms, broll: c.broll, graphics: c.graphics, trim: c.trim)
+        return Plain(color: c.color, audio: c.audio, cuts: c.cuts, zooms: c.zooms, broll: c.broll, graphics: c.graphics, trim: c.trim, volume: c.volume)
     }
 }
 
@@ -139,6 +141,7 @@ final class EditHistory {
         if x.graphics != y.graphics { parts.append(change(x.graphics.count, y.graphics.count, "Graphic")) }
         if x.color != y.color { parts.append(visualName(x.color, y.color)) }
         if x.audio != y.audio { parts.append("Sound Design") }
+        if x.volume != y.volume { parts.append("Volume") }
         return parts.count == 1 ? parts[0] : "Changes"
     }
 
@@ -180,7 +183,7 @@ extension PlayerWindowController {
         // The trim strip's own values (the player's in/out points pick up rounding when cuts change).
         let trim: [Double]? = isTrimmed ? [trimBar.start, trimBar.end] : nil
         return EditState(color: exportDrawer.snapshot, audio: drawer.snapshot,
-                         cuts: cuts, zooms: zooms, broll: broll, graphics: graphics, trim: trim)
+                         cuts: cuts, zooms: zooms, broll: broll, graphics: graphics, trim: trim, volume: volume)
     }
 
     /// Puts an earlier picture back. Only what differs is touched.
@@ -199,6 +202,7 @@ extension PlayerWindowController {
             }
         }
         if s.cuts != cuts { setCuts(s.cuts) }
+        if s.volume != volume { setVolume(s.volume) }
         if s.zooms != zooms { setZooms(s.zooms) }
 
         // B-roll: keep any shot that has downloaded since (an undo never "un-downloads").

@@ -199,6 +199,10 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         trimBar.onTrimChanged = { [weak self] start, end, movingStart, finished in
             self?.trimChanged(start: start, end: end, movingStart: movingStart, finished: finished)
         }
+        trimBar.onVolumeChanged = { [weak self] map, finished in
+            guard let self else { return }
+            if finished { self.setVolume(map) } else { self.volume = map }   // sound follows on mouse-up
+        }
         trimBar.onResizeSourceClip = { [weak self] index, left, delta in
             self?.resizeSourceClip(index: index, left: left, delta: delta)
         }
@@ -264,6 +268,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         assetsPanel.onSelect = { [weak self] id in self?.selectAsset(id) }
         assetsPanel.onToggleReject = { [weak self] id in self?.toggleAssetRejected(id) }
         assetsPanel.onRemove = { [weak self] id in self?.removeAsset(id) }
+        assetsPanel.onReorder = { [weak self] order in self?.reorderAssets(order) }
         assetsPanel.onBuild = { [weak self] in self?.buildAroll() }
         assetsPanel.onMoveToNewGroup = { [weak self] ids in self?.moveAssetsToNewGroup(ids) }
         assetsPanel.onMoveToGroup = { [weak self] ids, group in self?.moveAssets(ids, toGroup: group) }
@@ -451,6 +456,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         arollRecipe = nil
         selectedAssetID = assetID
         trimBar.showFullAsset = (currentTab == .assets && assetID != nil)
+        // Reviewing one source clip: the A-roll's volume sections don't apply to it (3.7.0).
+        trimBar.volume = assetID == nil ? volume : VolumeMap()
+        rack.setVolume(assetID == nil ? volume : VolumeMap(), cuts: [])
         releasePlayer()
         preparePlayer(AVURLAsset(url: url))
     }
@@ -461,6 +469,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         currentVideo = nil
         selectedAssetID = nil
         trimBar.showFullAsset = false
+        trimBar.volume = volume
+        rack.setVolume(volume, cuts: [])
         releasePlayer()
         preparePlayer(composition)
     }
@@ -1069,6 +1079,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         let start = trimRange?.start ?? 0
         p.seek(to: CMTime(seconds: toComp(start), preferredTimescale: 600),
                toleranceBefore: .zero, toleranceAfter: .zero)
+        trimBar.playhead = start
+        trimBar.revealPlayhead()
     }
 
     /// Transport › Go to end: the last frame before the trim end (pauses first).
@@ -1078,6 +1090,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         p.pause()
         let end = trimRange?.end ?? trimBar.duration
         seekExactly(p, to: toComp(end) - 1 / max(1, TrimBar.frameRate))
+        trimBar.playhead = max(0, end - 1 / max(1, TrimBar.frameRate))
+        trimBar.revealPlayhead()
     }
 
     /// Jump one second back or forward (pauses first).
@@ -1264,6 +1278,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     }
     private(set) var currentVideo: URL?
     var pendingRestore: ProjectData?     // settings waiting for the clip to finish loading
+    /// The timeline's zoom and scroll to put back after a clip-edge rebuild (3.6.2).
+    var pendingTimelineView: (length: Double, start: Double)?
     private var autosaveTimer: Timer?
     private var defaultColor: VisualDesignPanel.Snapshot?
     private var defaultAudio: SoundDesignPanel.Snapshot?
@@ -1599,6 +1615,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         project.data.zooms = zooms.isEmpty ? nil : zooms
         project.data.broll = broll.isEmpty ? nil : broll
         project.data.graphics = graphics.isEmpty ? nil : graphics
+        project.data.volume = volume.isFlat ? nil : volume
         project.data.assets = assets.isEmpty ? nil : assets
         if selectedAssetID == nil, let video = currentVideo, project.contains(video) {
             project.data.video = project.relativePath(of: video)
@@ -1650,8 +1667,13 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         setBroll(data.broll ?? [])
         addApprovedBrollToLibrary()
         setGraphics(data.graphics ?? [])
+        setVolume(data.volume ?? VolumeMap())
         if data.color?.stabilize == true { analyzeStabilization() }
         updateWindowTitle()
+        if let v = pendingTimelineView {
+            pendingTimelineView = nil
+            trimBar.restoreView(length: v.length, start: v.start)
+        }
     }
 
     func updateWindowTitle() {
@@ -1697,7 +1719,18 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var arollRecipe: String?
     var sourceAudioTrack: AVAssetTrack?
     private var sourceSampleRate: Double = 48_000
-    private var playbackCuts: [Cut] = []     // the cuts the current player item was built with
+    private var playbackCuts: [Cut] = [] {   // the cuts the current player item was built with
+        didSet { rack.setVolume(volume, cuts: playbackCuts) }   // the sound's clock skips them
+    }
+
+    /// A1 split points and section levels (3.7.0), in original-clip seconds.
+    private(set) var volume = VolumeMap()
+
+    func setVolume(_ map: VolumeMap) {
+        volume = map.normalized
+        trimBar.volume = volume
+        rack.setVolume(volume, cuts: playbackCuts)
+    }
     private var playbackBuild = 0
 
     /// Original-clip time → player time (a time inside a cut lands where the cut closes).
@@ -1962,9 +1995,15 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         let shots: [BrollRenderer.Shot] = broll.compactMap { (c: BrollClip) -> BrollRenderer.Shot? in
             guard let url = brollURL(c) else { return nil }
             var pip: BrollRenderer.PiP? = nil
-            if c.isPiP { pip = BrollRenderer.PiP(scale: c.pipScale ?? 1, x: c.pipX ?? 960, y: c.pipY ?? 540) }
+            if c.showsWhole {
+                if c.pipScale != nil || c.pipX != nil || c.pipY != nil || c.rotation != nil {
+                    pip = BrollRenderer.PiP(scale: c.pipScale ?? 1, x: c.pipX ?? 960, y: c.pipY ?? 540, rotation: c.rotation ?? 0)
+                }
+            } else if c.isPiP { pip = BrollRenderer.PiP(scale: c.pipScale ?? 1, x: c.pipX ?? 960, y: c.pipY ?? 540) }
             var shot = BrollRenderer.Shot(url: url, at: c.at, length: c.length, sourceIn: c.sourceIn ?? 0, photo: c.isPhoto)
             shot.zoom = c.zoom ?? 1; shot.panX = c.panX ?? 0; shot.panY = c.panY ?? 0
+            shot.push = c.isPhoto && c.push == true
+            shot.fit = c.showsWhole
             shot.group = c.visualGroup ?? VisualGroup.brollID
             shot.id = c.id
             shot.pip = pip
@@ -2130,7 +2169,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     /// B-roll Library too (each clip once). Runs when a project opens and when B-roll is applied.
     func addApprovedBrollToLibrary() {
         guard let project else { return }
-        for c in broll where c.pixabayId != nil || c.url != nil {
+        for c in broll where c.pixabayId != nil || c.url != nil || c.isGenerated {
             guard let file = c.file else { continue }
             SharedBrollLibrary.add(project.folder.appendingPathComponent(file), clip: c, project: project.name)
         }
@@ -2159,7 +2198,10 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
                     saved = try SharedBrollLibrary.copy(shared.file, into: folder)
                     credit = credit ?? shared.item.credit
                 } else if let s = c.url, let u = URL(string: s) {
-                    saved = try await BrollFetch.download(u, into: folder, base: "Unsplash \(Int(c.at))", ext: "jpg")
+                    let known = BrollList.isPhotoFile(u) || BrollList.isVideoFile(u)
+                    let ext = known ? u.pathExtension.lowercased() : (c.isPhoto ? "jpg" : "mp4")
+                    saved = try await BrollFetch.download(u, into: folder,
+                                                          base: c.isGenerated ? "Generated \(Int(c.at))" : "Unsplash \(Int(c.at))", ext: ext)
                 } else if let pid = c.pixabayId {
                     let (u, line) = try await BrollFetch.pixabayVideo(id: pid)
                     saved = try await BrollFetch.download(u, into: folder, base: "Pixabay \(pid)", ext: "mp4")
@@ -2635,6 +2677,24 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         assetsPanel.setAssets(assets, selectedID: selectedAssetID)
     }
 
+    /// Drag-to-reorder or Move Up/Down in the Assets list (3.6.1). The list order is the A-roll
+    /// order: every sort in the app is by sortDate, so this hands the clips' existing dates back
+    /// out in the new order (nudged apart if two were equal). Nothing is rebuilt until Build A-roll.
+    func reorderAssets(_ order: [UUID]) {
+        var byID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
+        var updated: [AssetEntry] = order.compactMap { byID.removeValue(forKey: $0) }
+        updated += assets.filter { byID[$0.id] != nil }   // anything the caller left out stays at the end
+        guard updated.map(\.id) != assets.map(\.id) else { return }
+        var dates = assets.map(\.sortDate).sorted()
+        for i in dates.indices.dropFirst() where dates[i] <= dates[i - 1] {
+            dates[i] = dates[i - 1].addingTimeInterval(0.001)
+        }
+        for i in updated.indices { updated[i].sortDate = dates[i] }
+        assets = updated
+        assetsPanel.setAssets(assets, selectedID: selectedAssetID)
+        saveProject()
+    }
+
     func removeAsset(_ id: UUID) {
         assets.removeAll { $0.id == id }
         if selectedAssetID == id {
@@ -2644,7 +2704,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         assetsPanel.setAssets(assets, selectedID: selectedAssetID)
     }
 
-    /// Assembles every non-rejected asset (oldest to newest, each trimmed to its own in/out) into
+    /// Assembles every non-rejected asset (in Assets-list order, each trimmed to its own in/out) into
     /// one AVMutableComposition and loads it as the working clip. Rebuildable: calling this again
     /// regenerates the composition from the current recipe. If that changes the total length,
     /// Cuts/Zooms/B-roll/Graphics are measured against the *old* timeline and no longer line up,
@@ -2664,10 +2724,12 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
                 self.showAlert("Couldn't build the A-roll", "One of the clips couldn't be read.")
                 return
             }
-            if hadPreviousBuild, abs(comp.duration.seconds - previousDuration) > 0.05 {
+            let recipeChanged = self.arollRecipe != nil && self.arollRecipe != Self.arollRecipe(included)
+            let hasEdits = !self.cuts.isEmpty || !self.zooms.isEmpty || !self.broll.isEmpty || !self.graphics.isEmpty
+            if hadPreviousBuild, abs(comp.duration.seconds - previousDuration) > 0.05 || (recipeChanged && hasEdits) {
                 let alert = NSAlert()
                 alert.messageText = "Rebuild the A-roll?"
-                alert.informativeText = "The assembled length changed, so Cuts, Zooms, B-roll and Graphics " +
+                alert.informativeText = "The clips or their order changed, so Cuts, Zooms, B-roll and Graphics " +
                     "will be cleared — they were positioned against the old timeline. Visual Design and " +
                     "Sound Design settings are kept."
                 alert.addButton(withTitle: "Rebuild")
@@ -2677,6 +2739,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
                 self.clearZooms()
                 self.clearBroll()
                 self.setGraphics([])
+                self.setVolume(VolumeMap())
             }
             guard self.project === project else { return }
             if !restoring {
@@ -2709,16 +2772,24 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         else { entry.outPoint = max(entry.inPoint + 0.05, min(entry.duration, entry.outPoint + delta)) }
         guard abs(entry.inPoint - updated[assetIndex].inPoint) > 0.001 ||
               abs(entry.outPoint - updated[assetIndex].outPoint) > 0.001 else { return }
-        if !cuts.isEmpty || !zooms.isEmpty || !broll.isEmpty || !graphics.isEmpty || isTrimmed {
-            let alert = NSAlert()
-            alert.messageText = "Change this clip's length?"
-            alert.informativeText = "Changing the length shifts the timeline. The current timeline trim, cuts, zooms, B-roll and graphics will be cleared."
-            alert.addButton(withTitle: "Change Clip")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // Ripple (3.6.2): everything after the edge slides with it, so cuts, zooms, B-roll, graphics
+        // and the timeline trim stay on the same words. Only what falls in a removed stretch moves
+        // to the edit point (a cut there shrinks or goes).
+        var clipStart = 0.0
+        for e in included.prefix(index) { clipStart += e.outPoint - e.inPoint }
+        let clipEnd = clipStart + (included[index].outPoint - included[index].inPoint)
+        let applied = left ? entry.inPoint - included[index].inPoint : entry.outPoint - included[index].outPoint
+        let pivot: Double, removed: Double, shift: Double
+        if left {
+            pivot = clipStart; removed = max(0, applied); shift = -applied
+        } else {
+            pivot = clipEnd + min(0, applied); removed = max(0, -applied); shift = applied
+        }
+        let ripple: (Double) -> Double = { t in
+            t < pivot ? t : (t >= pivot + removed ? t + shift : pivot)
         }
         updated[assetIndex] = entry
-        applyAssetTrims(updated) { [weak self] ok in
+        applyAssetTrims(updated, ripple: ripple) { [weak self] ok in
             if !ok { self?.showAlert("Couldn't resize the clip", "The source clips couldn't be assembled. No changes were made.") }
         }
     }
@@ -2726,8 +2797,24 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     /// Saves new in/out points for the source clips and rebuilds V1 from them (3.4.0). The timeline
     /// trim, cuts, zooms, B-roll and graphics are cleared: they were placed against the old timeline.
     /// `done(false)` = the clips couldn't be assembled and nothing changed.
-    func applyAssetTrims(_ updated: [AssetEntry], done: @escaping (Bool) -> Void) {
+    func applyAssetTrims(_ updated: [AssetEntry], ripple: ((Double) -> Double)? = nil, done: @escaping (Bool) -> Void) {
         guard let project else { done(false); return }
+        // With a ripple, the current edits are carried over onto the new timeline instead of cleared.
+        var kept: (cuts: [Cut], zooms: [ZoomEvent], broll: [BrollClip], graphics: [GraphicPlate],
+                   trim: (Double, Double)?)? = nil
+        var volumeKept = VolumeMap()
+        if let f = ripple {
+            let cutsNow = cuts.map { Cut(start: f($0.start), end: f($0.end), reason: $0.reason, note: $0.note) }
+                .filter { $0.length >= CutList.minimumLength }
+            let zoomsNow = zooms.map { z -> ZoomEvent in var z = z; z.at = f(z.at); return z }
+            let brollNow = broll.map { b -> BrollClip in var b = b; b.at = f(b.at); return b }
+            let graphicsNow = graphics.map { g -> GraphicPlate in
+                var g = g; g.at = f(g.at); g.builds = g.builds?.map(f); return g
+            }
+            let trimNow = isTrimmed ? trimRange.map { (f($0.start), f($0.end)) } : nil
+            volumeKept = volume.rippled(f)
+            kept = (cutsNow, zoomsNow, brollNow, graphicsNow, trimNow)
+        }
         let newIncluded = updated.filter { !$0.rejected }.sorted { $0.sortDate < $1.sortDate }
         Task { @MainActor in
             guard let comp = await Self.assembleComposition(assets: newIncluded, in: project) else {
@@ -2739,6 +2826,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             self.clearZooms()
             self.clearBroll()
             self.setGraphics([])
+            self.setVolume(VolumeMap())
             self.assets = updated
             self.assetsPanel.setAssets(updated, selectedID: nil)
             project.data.video = nil
@@ -2748,6 +2836,22 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             project.data.zooms = nil
             project.data.broll = nil
             project.data.graphics = nil
+            project.data.volume = nil
+            if let kept {
+                project.data.volume = volumeKept.isFlat ? nil : volumeKept
+                project.data.cuts = kept.cuts.isEmpty ? nil : kept.cuts
+                project.data.zooms = kept.zooms.isEmpty ? nil : kept.zooms
+                project.data.broll = kept.broll.isEmpty ? nil : kept.broll
+                project.data.graphics = kept.graphics.isEmpty ? nil : kept.graphics
+                project.data.trimStart = kept.trim?.0
+                project.data.trimEnd = kept.trim?.1
+                project.data.suggestedCuts = nil   // made from the transcript, which no longer lines up
+                self.suggestedCuts = []
+                // Put them back once the rebuilt A-roll has loaded (same path as opening a project),
+                // with the timeline zoomed and scrolled as it was.
+                self.pendingRestore = project.data
+                self.pendingTimelineView = self.trimBar.viewState
+            }
             var cursor = 0.0
             self.trimBar.sourceClipBoundaries = newIncluded.dropLast().map { item in
                 cursor += item.outPoint - item.inPoint

@@ -24,6 +24,7 @@ struct ProjectData: Codable {
     var zooms: [ZoomEvent]?         // punch-in zooms (original-clip seconds)
     var broll: [BrollClip]?         // V2 B-roll shots
     var graphics: [GraphicPlate]?   // V3 motion graphics plates
+    var volume: VolumeMap?          // A1 split points and section levels (3.7.0)
     var assets: [AssetEntry]?       // Assets tab (3.1.0): source clips for the assembled A-roll
     var visualGroups: [VisualGroup]? // Visual Design groups (3.2): a look per group of clips
 }

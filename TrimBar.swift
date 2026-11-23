@@ -115,7 +115,101 @@ final class TrimBar: NSView {
     var onScrub: ((Double, Bool) -> Void)?
 
     private var thumbnails: [NSImage?] = []
-    private enum Drag { case none, start, end, playhead, cutStart(Int), cutEnd(Int), sourceEdge(Int, Bool), pan(Double), zoomMark(Int), broll(Int, Int), graphics(Int, Int) }
+    // MARK: A1 — volume sections (3.7.0)
+
+    /// Split points and one level per section, drawn as a line across A1 (0 dB at the dashed guide).
+    var volume = VolumeMap() { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    /// A volume edit: `finished` is false while dragging, true on mouse-up (and for splits).
+    var onVolumeChanged: ((VolumeMap, Bool) -> Void)?
+    private var volumeDragY: CGFloat = 0
+
+    private func volumeY(_ db: Double, in lane: NSRect) -> CGFloat {
+        let f = (VolumeMap.maxDb - db) / (VolumeMap.maxDb - VolumeMap.minDb)
+        return lane.minY + 4 + CGFloat(f) * (lane.height - 8)
+    }
+
+    private var pointsPerDb: CGFloat { (audioLaneRect.height - 8) / CGFloat(VolumeMap.maxDb - VolumeMap.minDb) }
+
+    /// Each section's left and right x on screen.
+    private func volumeSectionX(_ i: Int) -> (CGFloat, CGFloat) {
+        let a = i == 0 ? 0 : volume.splits[i - 1]
+        let b = i < volume.splits.count ? volume.splits[i] : duration
+        return (x(for: a), x(for: b))
+    }
+
+    private func volumeSplitHit(_ p: NSPoint) -> Int? {
+        guard audioLaneRect.contains(p) else { return nil }
+        var best: (Int, CGFloat)?
+        for (i, t) in volume.splits.enumerated() {
+            let d = abs(x(for: t) - p.x)
+            if d <= 5, d < (best?.1 ?? .greatestFiniteMagnitude) { best = (i, d) }
+        }
+        return best?.0
+    }
+
+    private func volumeLineHit(_ p: NSPoint) -> Int? {
+        let lane = audioLaneRect
+        guard lane.contains(p) else { return nil }
+        let i = volume.section(at: time(atX: p.x))
+        guard volume.gains.indices.contains(i) else { return nil }
+        return abs(volumeY(volume.gains[i], in: lane) - p.y) <= 6 ? i : nil
+    }
+
+    private static func dbText(_ db: Double) -> String {
+        abs(db) < 0.05 ? "0.0 dB" : String(format: "%+.1f dB", db)
+    }
+
+    private func drawVolume(in lane: NSRect) {
+        // The 0 dB guide.
+        let zeroY = volumeY(0, in: lane)
+        let guide = NSBezierPath()
+        guide.move(to: NSPoint(x: lane.minX, y: zeroY))
+        guide.line(to: NSPoint(x: lane.maxX, y: zeroY))
+        guide.lineWidth = 1
+        guide.setLineDash([3, 3], count: 2, phase: 0)
+        NSColor.white.withAlphaComponent(0.22).setStroke()
+        guide.stroke()
+        let lineColor = NSColor.systemOrange
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold),
+                                                    .foregroundColor: lineColor]
+        var active: Int?
+        if case .volumeLevel(let i, _) = drag { active = i }
+        // Split markers.
+        for t in volume.splits {
+            let sx = x(for: t)
+            guard sx >= lane.minX - 1, sx <= lane.maxX + 1 else { continue }
+            NSColor.white.withAlphaComponent(0.45).setFill()
+            NSRect(x: sx - 0.5, y: lane.minY, width: 1, height: lane.height).fill()
+            let tab = NSBezierPath()
+            tab.move(to: NSPoint(x: sx - 4, y: lane.minY))
+            tab.line(to: NSPoint(x: sx + 4, y: lane.minY))
+            tab.line(to: NSPoint(x: sx, y: lane.minY + 5))
+            tab.close()
+            NSColor.white.withAlphaComponent(0.8).setFill()
+            tab.fill()
+        }
+        // The level line, section by section, joined at each split.
+        let path = NSBezierPath()
+        for i in volume.gains.indices {
+            let (a, b) = volumeSectionX(i)
+            let y = volumeY(volume.gains[i], in: lane)
+            if i == 0 { path.move(to: NSPoint(x: a, y: y)) } else { path.line(to: NSPoint(x: a, y: y)) }
+            path.line(to: NSPoint(x: b, y: y))
+            // Label each section that isn't at 0 dB (and the one being dragged), if there's room.
+            let left = max(a, lane.minX), right = min(b, lane.maxX)
+            if right - left > 60, abs(volume.gains[i]) >= 0.05 || active == i {
+                let text = Self.dbText(volume.gains[i]) as NSString
+                let ty = y < lane.minY + 14 ? y + 2 : y - 13
+                text.draw(at: NSPoint(x: left + 4, y: ty), withAttributes: attrs)
+            }
+        }
+        path.lineWidth = 1.5
+        lineColor.setStroke()
+        path.stroke()
+    }
+
+    private enum Drag { case none, start, end, playhead, cutStart(Int), cutEnd(Int), sourceEdge(Int, Bool), pan(Double), zoomMark(Int), broll(Int, Int), graphics(Int, Int),
+                               volumeLevel(Int, Double), volumeSplit(Int) }
 
     // MARK: V2 — B-roll track (above the clips)
 
@@ -368,6 +462,19 @@ final class TrimBar: NSView {
     func zoomOut() { setZoom(zoom / 1.6) }
     func zoomToFit() { setZoom(1) }
 
+    /// How much time the strip shows and where it starts (3.6.2), so a rebuild of the A-roll
+    /// (dragging a clip edge) can put the view back instead of zooming all the way out.
+    var viewState: (length: Double, start: Double) { (visibleLength, viewStart) }
+
+    func restoreView(length: Double, start: Double) {
+        guard duration > 0, length > 0 else { return }
+        zoom = min(max(1, shownLength / length), maxZoom)
+        viewStart = start
+        clampView()
+        syncZoomSlider()
+        viewChanged()
+    }
+
     /// Changes zoom, keeping `anchor` (default: the playhead) at the same spot on screen.
     func setZoom(_ z: Double, around anchor: Double? = nil) {
         guard duration > 0 else { return }
@@ -402,6 +509,17 @@ final class TrimBar: NSView {
     }
     @objc private func zoomInClicked(_ sender: Any?) { zoomIn() }
     @objc private func zoomOutClicked(_ sender: Any?) { zoomOut() }
+
+    /// Jumps (Go to Start/End): when zoomed in, scroll so the playhead is on screen (3.6.2).
+    func revealPlayhead() {
+        guard zoom > 1 else { return }
+        let r = visibleRange
+        let ph = shown(playhead)
+        guard ph < r.start || ph > r.end else { return }
+        viewStart = ph - visibleLength * 0.5
+        clampView()
+        viewChanged()
+    }
 
     /// During playback, page the view along so the playhead never runs off the edge.
     private func followPlayhead() {
@@ -547,6 +665,10 @@ final class TrimBar: NSView {
         drawFilmstrip(in: strip)
         drawV1Highlight(in: strip)
         drawWaveform(in: audioLaneRect)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: audioLaneRect).addClip()
+        drawVolume(in: audioLaneRect)
+        NSGraphicsContext.restoreGraphicsState()
 
         // When zoomed, keep everything on the strip (plus room for the trim handles).
         NSGraphicsContext.saveGraphicsState()
@@ -875,7 +997,11 @@ final class TrimBar: NSView {
             var t1 = time(atX: px + step)
             if t1 <= t0 || t1 - t0 > secondsPerStep * 1.5 { t1 = t0 + secondsPerStep }   // across a cut
             let s0 = Int(t0 * sr), s1 = max(Int(t1 * sr), s0 + 1)
-            let v = wf.summary(from: s0, to: s1) ?? (0, 0, 0)
+            var v = wf.summary(from: s0, to: s1) ?? (0, 0, 0)
+            if !volume.isFlat {   // the waveform shows each section's level, like clip gain in a DAW
+                let g = volume.linear(at: t0)
+                v = (v.0 * g, v.1 * g, v.2 * g)
+            }
             var top = midY - CGFloat(v.max) * half, bottom = midY - CGFloat(v.min) * half
             if bottom - top < minThick { top = (top + bottom) / 2 - minThick / 2; bottom = top + minThick }
             let r = CGFloat(v.rms) * half
@@ -918,7 +1044,8 @@ final class TrimBar: NSView {
             let px = x(for: t)
             // Samples inside a cut all land on its edge: leave a gap there instead of a scribble.
             if px - prevX < ptsPerSample * 0.25 { points.append(nil); continue }
-            guard let v = wf.sample(i) else { return false }
+            guard var v = wf.sample(i) else { return false }
+            if !volume.isFlat { v *= volume.linear(at: t) }
             points.append(NSPoint(x: px, y: midY - CGFloat(v) * half))
             prevX = px
         }
@@ -1201,6 +1328,18 @@ final class TrimBar: NSView {
         for z in zoomMarks {
             addCursorRect(NSRect(x: x(for: z.at) - 6, y: stripRect.minY - 12, width: 12, height: 13), .openHand)
         }
+        // A1: split points slide sideways, section lines move up and down.
+        let lane = audioLaneRect
+        let addLaneRect: (NSRect, NSCursor) -> Void = { r, c in
+            let r = r.intersection(lane)
+            if !r.isEmpty { self.addCursorRect(r, cursor: c) }
+        }
+        for i in volume.gains.indices {
+            let (a, b) = volumeSectionX(i)
+            let y = volumeY(volume.gains[i], in: lane)
+            addLaneRect(NSRect(x: a + 5, y: y - 6, width: max(0, b - a - 10), height: 12), .resizeUpDown)
+        }
+        for t in volume.splits { addLaneRect(NSRect(x: x(for: t) - 5, y: lane.minY, width: 10, height: lane.height), .resizeLeftRight) }
         // Each red cut's left and right edge can be grabbed and dragged.
         let s = stripRect
         for c in cuts {
@@ -1257,6 +1396,30 @@ final class TrimBar: NSView {
             graphicsLive = (hit.0, g.start, g.end)
             return
         }
+        // A1 volume (3.7.0): double-click splits (or removes a split), drag a split sideways or a
+        // section's line up and down. Anywhere else on A1 still moves the playhead.
+        if audioLaneRect.contains(p) {
+            if event.clickCount == 2 {
+                var m = volume
+                if let i = volumeSplitHit(p) { m.removeSplit(i) } else { m.split(at: time(atX: p.x)) }
+                drag = .none
+                volume = m
+                onVolumeChanged?(m, true)
+                return
+            }
+            if let i = volumeSplitHit(p) {
+                drag = .volumeSplit(i)
+                layoutFrozen = true
+                return
+            }
+            if let i = volumeLineHit(p) {
+                drag = .volumeLevel(i, volume.gains[i])
+                volumeDragY = p.y
+                layoutFrozen = true
+                needsDisplay = true
+                return
+            }
+        }
         // Visual Design: any click on V1 picks that clip's design group, including clicks that land
         // on a clip edge, trim handle, zoom marker or cut edge (those still start their drag below).
         if stripRect.insetBy(dx: 0, dy: -8).contains(p) {
@@ -1300,6 +1463,25 @@ final class TrimBar: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        switch drag {
+        case .volumeLevel(let i, let origin):
+            // Up = louder. ⇧ for fine steps. Snaps to 0 dB.
+            let fine: CGFloat = event.modifierFlags.contains(.shift) ? 0.2 : 1
+            var db = origin + Double((volumeDragY - p.y) / pointsPerDb * fine)
+            db = (db * 10).rounded() / 10
+            if abs(db) < 0.4 && abs(origin) >= 0.4 || abs(db) < 0.05 { db = 0 }
+            db = min(VolumeMap.maxDb, max(VolumeMap.minDb, db))
+            guard volume.gains.indices.contains(i), volume.gains[i] != db else { return }
+            volume.gains[i] = db
+            onVolumeChanged?(volume, false)
+            return
+        case .volumeSplit(let i):
+            volume.moveSplit(i, to: time(atX: p.x))
+            onVolumeChanged?(volume, false)
+            return
+        default:
+            break
+        }
         if case .pan(let offset) = drag {
             viewStart = Double((p.x - overviewRect.minX) / overviewRect.width) * shownLength - offset
             clampView()
@@ -1371,6 +1553,8 @@ final class TrimBar: NSView {
             let c = resized(i, leftEdge: isLeft, to: edgeT)
             resizing = c
             cuts[i] = c          // draw it live; the player is rebuilt when you let go
+        case .volumeLevel, .volumeSplit:
+            break
         case .none:
             break
         }
@@ -1390,6 +1574,8 @@ final class TrimBar: NSView {
 
     override func mouseUp(with event: NSEvent) {
         switch drag {
+        case .volumeLevel, .volumeSplit:
+            onVolumeChanged?(volume, true)
         case .sourceEdge(let index, let left):
             if abs(sourceEdgeDelta) > 0.001 { onResizeSourceClip?(index, left, sourceEdgeDelta) }
             sourceEdgeDelta = 0

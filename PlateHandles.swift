@@ -10,11 +10,16 @@ import Cocoa
 import AVFoundation
 
 final class PlateHandlesView: NSView {
-    enum Grab: Equatable { case move, corner(Int) }   // corners: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+    enum Grab: Equatable { case move, corner(Int), rotate }   // corners: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
 
     /// The active plate's box and the other plates on screen, in this view's (flipped) coordinates.
     var box: NSRect? { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
     var others: [(index: Int, rect: NSRect)] = [] { didSet { needsDisplay = true } }
+    /// 3.8.0 (B-roll pictures): the box's turn in radians, clockwise on screen, and whether it gets
+    /// a rotate knob above its top edge.
+    var angle: CGFloat = 0 { didSet { if angle != oldValue { needsDisplay = true; window?.invalidateCursorRects(for: self) } } }
+    var rotatable = false { didSet { if rotatable != oldValue { needsDisplay = true } } }
+    private let knobGap: CGFloat = 26
 
     var onGrab: ((Grab, NSPoint) -> Void)?
     var onDrag: ((NSPoint, _ shift: Bool) -> Void)?
@@ -33,8 +38,23 @@ final class PlateHandlesView: NSView {
          NSPoint(x: r.minX, y: r.maxY), NSPoint(x: r.maxX, y: r.maxY)]
     }
 
-    private func grab(at p: NSPoint) -> Grab? {
+    /// A view point turned into the box's own (unturned) frame.
+    private func local(_ p: NSPoint, _ r: NSRect) -> NSPoint {
+        guard angle != 0 else { return p }
+        let dx = p.x - r.midX, dy = p.y - r.midY, c = cos(-angle), s = sin(-angle)
+        return NSPoint(x: r.midX + dx * c - dy * s, y: r.midY + dx * s + dy * c)
+    }
+
+    /// Above the top edge, or just inside it when there's no room above (a picture as tall as the frame).
+    private func knob(_ r: NSRect) -> NSPoint {
+        let above = r.minY - knobGap
+        return NSPoint(x: r.midX, y: above >= bounds.minY + 10 ? above : r.minY + knobGap)
+    }
+
+    private func grab(at viewPoint: NSPoint) -> Grab? {
         guard let r = box else { return nil }
+        let p = local(viewPoint, r)
+        if rotatable, hypot(p.x - knob(r).x, p.y - knob(r).y) <= 10 { return .rotate }
         for (i, c) in corners(r).enumerated() where abs(p.x - c.x) <= corner && abs(p.y - c.y) <= corner {
             return .corner(i)
         }
@@ -52,6 +72,11 @@ final class PlateHandlesView: NSView {
 
     override func resetCursorRects() {
         guard let r = box else { return }
+        if angle != 0 { return }      // turned: the plain arrow (cursor rects can't turn)
+        if rotatable {
+            let k = knob(r)
+            addCursorRect(NSRect(x: k.x - 10, y: k.y - 10, width: 20, height: 20), cursor: .pointingHand)
+        }
         addCursorRect(r, cursor: .openHand)
         for c in corners(r) {
             addCursorRect(NSRect(x: c.x - corner, y: c.y - corner, width: corner * 2, height: corner * 2), cursor: .crosshair)
@@ -90,6 +115,28 @@ final class PlateHandlesView: NSView {
             path.stroke()
         }
         guard let r = box else { return }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        if angle != 0 {
+            let t = NSAffineTransform()
+            t.translateX(by: r.midX, yBy: r.midY)
+            t.rotate(byRadians: angle)
+            t.translateX(by: -r.midX, yBy: -r.midY)
+            t.concat()
+        }
+        if rotatable {
+            let k = knob(r)
+            let stem = NSBezierPath()
+            stem.move(to: NSPoint(x: r.midX, y: r.minY)); stem.line(to: NSPoint(x: k.x, y: k.y + (k.y < r.minY ? 7 : -7)))
+            stem.lineWidth = 1.5
+            NSColor(srgbRed: 0.24, green: 0.80, blue: 0.78, alpha: 1).setStroke(); stem.stroke()
+            let disc = NSBezierPath(ovalIn: NSRect(x: k.x - 7, y: k.y - 7, width: 14, height: 14))
+            NSColor.white.setFill(); disc.fill()
+            disc.lineWidth = 1.5; NSColor(srgbRed: 0.24, green: 0.80, blue: 0.78, alpha: 1).setStroke(); disc.stroke()
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: k, radius: 3.5, startAngle: 30, endAngle: 300)
+            arc.lineWidth = 1.3; NSColor.black.withAlphaComponent(0.75).setStroke(); arc.stroke()
+        }
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.6)
         shadow.shadowBlurRadius = 3
@@ -264,6 +311,8 @@ extension PlayerWindowController {
             // The nudge that puts the newly sized plate exactly in that box.
             d.newDX = box.minX - d.pivot.x - d.newScale * (d.base.minX - d.pivot.x)
             d.newDY = box.minY - d.pivot.y - d.newScale * (d.base.minY - d.pivot.y)
+        case .rotate:
+            return      // plates don't turn
         }
         plateDrag = d
         plateHandles.box = map(box)

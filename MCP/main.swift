@@ -10,7 +10,7 @@
 
 import Foundation
 
-let serverVersion = "2.11.0"
+let serverVersion = "2.13.0"
 let bundleID = "com.itsscottwilder.timecodeplayer"
 let supportPath = NSHomeDirectory() + "/Library/Application Support/1Shot"
 let socketPath = supportPath + "/mcp.sock"
@@ -234,9 +234,9 @@ let tool_set_sound: [String: Any] = [
 
 let tool_find_dead_air: [String: Any] = [
     "name": "find_dead_air",
-    "description": "Pipeline step 1. Measures the silence at the start and end of every clip in the Assets tab (oldest first, numbered from 1; rejected clips are skipped) and proposes each clip's in/out: lead seconds before the first sound, tail seconds after the last. Times are seconds in each clip's own file. Changes nothing. Show the user each clip's dead air and proposed in/out, then stop for approval.",
+    "description": "Pipeline step 1. Measures the silence at the start and end of every clip in the Assets tab (in Assets-list order, numbered from 1; rejected clips are skipped) and proposes each clip's in/out: lead seconds before the first sound, tail seconds after the last. Times are seconds in each clip's own file. Changes nothing. Show the user each clip's dead air and proposed in/out, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
-        "clips": ["type": "array", "items": ["type": "integer"], "description": "Only these clips (numbers from 1, oldest first). Default: all."],
+        "clips": ["type": "array", "items": ["type": "integer"], "description": "Only these clips (numbers from 1, in Assets-list order). Default: all."],
         "lead": prop("number", "Seconds to keep before the first sound, 0–2. Default 0.3."),
         "tail": prop("number", "Seconds to keep after the last sound, 0–3. Default 0.5.")
     ]],
@@ -248,7 +248,7 @@ let tool_set_clip_trims: [String: Any] = [
     "description": "Pipeline step 1. Sets the in/out of one or more Assets-tab clips (seconds in each clip's own file; clips you leave out keep theirs) and rebuilds the A-roll from them. If the A-roll already has cuts, zooms, B-roll or graphics, this refuses unless clearEdits: true, because the timeline shifts and they are cleared: ask the user first. Answers with every clip's in/out and the A-roll length. Use only the in/out points the user approved.",
     "inputSchema": ["type": "object", "properties": [
         "clips": ["type": "array", "description": "One entry per clip to change.", "items": ["type": "object", "properties": [
-            "clip": prop("integer", "Clip number from find_dead_air (from 1, oldest first)."),
+            "clip": prop("integer", "Clip number from find_dead_air (from 1, in Assets-list order)."),
             "in": prop("number", "In point, seconds in the clip's file."),
             "out": prop("number", "Out point, seconds in the clip's file.")
         ], "required": ["clip"]]],
@@ -256,9 +256,18 @@ let tool_set_clip_trims: [String: Any] = [
     ], "required": ["clips"]]
 ]
 
+let tool_set_clip_order: [String: Any] = [
+    "name": "set_clip_order",
+    "description": "Puts the Assets-tab clips in a new order: the order the A-roll plays them in (the user may record out of order). List the current clip numbers in their new order; clips you leave out follow, in their current order. If the A-roll is built it is rebuilt; if it already has cuts, zooms, B-roll or graphics this refuses unless clearEdits: true (ask the user first). Answers with the clips, renumbered in the new order. The user can also drag clips in the Assets list.",
+    "inputSchema": ["type": "object", "properties": [
+        "order": ["type": "array", "items": ["type": "integer"], "description": "Current clip numbers (from 1), in the order they should play."],
+        "clearEdits": prop("boolean", "true = OK to clear cuts, zooms, B-roll and graphics (only after the user agrees).")
+    ], "required": ["order"]]
+]
+
 let tool_compare_clips: [String: Any] = [
     "name": "compare_clips",
-    "description": "Pipeline step 2. A contact sheet of every Assets-tab clip (oldest first, numbered from 1): three frames each, at 10 %, 50 % and 90 % of its in/out, as recorded. Also each clip's current Visual Design group and a rough difference score for every pair (0 = identical, higher = more different). Changes nothing. Compare the looks, propose groups (clip 1's look is Default; every other look gets a new group named after what it looks like), then stop for approval.",
+    "description": "Pipeline step 2. A contact sheet of every Assets-tab clip (in Assets-list order, numbered from 1): three frames each, at 10 %, 50 % and 90 % of its in/out, as recorded. Also each clip's current Visual Design group and a rough difference score for every pair (0 = identical, higher = more different). Changes nothing. Compare the looks, propose groups (clip 1's look is Default; every other look gets a new group named after what it looks like), then stop for approval.",
     "inputSchema": ["type": "object", "properties": [:] as [String: Any]],
     "annotations": ["readOnlyHint": true]
 ]
@@ -333,13 +342,14 @@ let tool_apply_zooms: [String: Any] = [
 
 let tool_apply_broll: [String: Any] = [
     "name": "apply_broll",
-    "description": "Pipeline step 9. Puts B-roll on V2 and downloads it into the project (Pixabay video by search, Unsplash photo by url). STOCK ONLY for now: shots with a file are refused. Follow the 'B-roll - Talking Head' style guide (read_style_guide). The user's own manually added clips stay. Downloads can take a while: if not done in 45 s, call status with wait: 45. Show the user the spots and what's on V2, then stop for approval.",
+    "description": "Pipeline step 9. Puts B-roll on V2 and downloads it into the project (Pixabay video by pixabayId or search, Unsplash photo by url, generated clips by url or file). Stock or generated only: a file is refused unless the shot has generated: true (an AI service or Claude made it). Follow the 'B-roll - Talking Head' style guide (read_style_guide). The user's own manually added clips stay. Downloads can take a while: if not done in 45 s, call status with wait: 45. Place every approved shot in one call. Show the user the spots and what's on V2, then stop for approval.",
     "inputSchema": ["type": "object", "properties": [
-        "broll": ["type": "array", "description": "Shots: {at, length, kind (video/photo), and exactly one of pixabayId (a clip the user picked from a candidate sheet; preferred), search (Pixabay's top match, unchecked) or url (an Unsplash photo with credit, or a Pixabay link the user pasted, which becomes that exact clip), reason, words}.",
+        "broll": ["type": "array", "description": "Shots: {at, length, kind (video/photo), and exactly one of pixabayId (a clip the user picked from a candidate sheet; preferred), search (Pixabay's top match, unchecked), url (an Unsplash photo with credit, a Pixabay link the user pasted, which becomes that exact clip, or a generated clip's link) or file (a generated clip on this Mac), reason, words}. Generated shots add generated: true and prompt (what made it); kind video for a generated video link.",
                   "items": ["type": "object", "properties": [
                     "at": ["type": "number"], "length": ["type": "number"], "kind": ["type": "string"],
                     "pixabayId": ["type": "integer"], "search": ["type": "string"], "url": ["type": "string"], "credit": ["type": "string"],
-                    "reason": ["type": "string"], "words": ["type": "string"]
+                    "reason": ["type": "string"], "words": ["type": "string"],
+                    "file": ["type": "string"], "generated": ["type": "boolean"], "prompt": ["type": "string"]
                   ], "required": ["at"]]],
         "brollList": prop(objectOrString, "Instead of broll: the style guide's whole output object."),
         "mode": ["type": "string", "enum": ["replace", "clear"], "description": "replace (default) or clear (keeps the user's own clips)."],
@@ -349,13 +359,18 @@ let tool_apply_broll: [String: Any] = [
 
 let tool_broll_candidates: [String: Any] = [
     "name": "broll_candidates",
-    "description": "Step 7 helper: B-roll candidates from Pixabay as a numbered contact sheet of thumbnails (number, length and tags under each), returned as an image and saved in the project's B-roll Candidates folder. search: look at up to 40 results for a spot. Pixabay's API searches tags only and finds far fewer clips than pixabay.com, so a short sheet widens on its own (each word separately, then the also searches); add also with related scenes or objects for thin topics. ids: a sheet of just the clips you choose, in your order, e.g. your 10 favorites to show the user. The user picks a number; put that clip's pixabayId in apply_broll.",
+    "description": "Step 7 helper: B-roll candidates from Pixabay as a numbered contact sheet of thumbnails (number, length and tags under each), returned as an image and saved in the project's B-roll Candidates folder. search: look at up to 40 results for a spot. Pixabay's API searches tags only and finds far fewer clips than pixabay.com, so a short sheet widens on its own (each word separately, then the also searches); add also with related scenes or objects for thin topics. ids: a sheet of just the clips you choose, in your order. spots: the whole-video review sheet, a titled row per spot with your pick first (outlined, labelled 1A, 2A…) and alternates after it (1B, 1C); picks can be Pixabay ids or links, generated clips on this Mac (file paths) or links to them. The user names only the spots to change.",
     "inputSchema": ["type": "object", "properties": [
         "search": prop("string", "Words to look for, e.g. phone on tripod in backyard. Search for the scene or object, not a mood."),
         "count": prop("number", "How many results to show for a search, 1 to 40 (default 20)."),
         "also": ["type": "array", "items": ["type": "string"], "description": "More searches to fill the sheet when the main one comes up short, e.g. [\"camera outdoors\", \"photographer field\"]. Duplicates are dropped."],
         "ids": ["type": "array", "items": ["type": ["integer", "string"]], "description": "Pixabay video ids, or Pixabay links the user pasted (page or download links), to show instead of searching, numbered in this order."],
-        "title": prop("string", "Sheet title and file name, e.g. 0-54 talk into your camera.")
+        "title": prop("string", "Sheet title and file name, e.g. 0-54 talk into your camera."),
+        "spots": ["type": "array", "description": "Whole-video review sheet instead of search/ids: [{title (e.g. 0:54 talk into your camera), picks: [your pick, then up to 2 alternates]}]. A pick is a Pixabay id or link, a file path to a generated clip or still, or a link to one.",
+                  "items": ["type": "object", "properties": [
+                    "title": ["type": "string"], "at": ["type": "number"], "words": ["type": "string"],
+                    "picks": ["type": "array", "items": ["type": ["integer", "string"]]]
+                  ], "required": ["picks"]]]
     ]],
     "annotations": ["readOnlyHint": true]
 ]
@@ -493,6 +508,7 @@ let tools: [[String: Any]] = [
     tool_list_groups,
     tool_find_dead_air,
     tool_set_clip_trims,
+    tool_set_clip_order,
     tool_compare_clips,
     tool_set_clip_groups,
     tool_set_sound,
@@ -528,7 +544,7 @@ The user can define their own workflow. Below is the workflow to follow. If it d
 let defaultWorkflow = """
 Work the pipeline ONE STEP AT A TIME. Before each step, say which step is next and what you'll do, then wait for the user's go-ahead. After the step, show the result, ask for feedback and corrections, and wait. Never start the next step until they say so. Any step can be redone.
 0 Open file: open_project. Show the project name, clip length and frame.
-1 Clip in/out points: the first thing after the clips are in the Assets tab. find_dead_air measures the silence at the start and end of each clip and proposes an in/out for each. Show every clip with its dead air at start and end and the proposed in/out, flag anything odd (no voice found, a noise that may have been counted as sound), then STOP. The user approves or changes them; set_clip_trims applies the approved ones and rebuilds the A-roll. If the project has no Assets-tab clips (one video), skip this step.
+1 Clip in/out points: the first thing after the clips are in the Assets tab. find_dead_air measures the silence at the start and end of each clip and proposes an in/out for each. Show every clip with its dead air at start and end and the proposed in/out, flag anything odd (no voice found, a noise that may have been counted as sound), then STOP. The user approves or changes them; set_clip_trims applies the approved ones and rebuilds the A-roll. Clips play in the Assets-list order, top to bottom: if the user recorded out of order, they drag clips there, or say the order and you use set_clip_order. If the project has no Assets-tab clips (one video), skip this step.
 2 Visual Design groups: compare_clips shows every clip (three frames each, as recorded) and a rough difference score per pair. Clip 1 defines the Default group: clips that look like it (same camera angle, framing, lighting, background, colour) stay in Default; each different look gets its own new group, named after what it looks like (e.g. "Close-up – lamp light"). Show the proposed groups with the reason for each, then STOP. After approval, set_clip_groups applies them. Skip this step if the project has one clip.
 3 Visual Design: The user does this themself for now. Each clip belongs to a Visual Design group with its own look; list_groups shows them. Use get_settings and snapshot_frame to read their choices group by group, explain what you think each is for, and say plainly which you can't explain. Use set_visual only if they ask.
 4 Sound Design: The user does this themself for now. Use get_settings with measure: true and explain the same way, including how far the edit is from YouTube's −14 LUFS. You can't listen, so their ears are the final say. Use set_sound only if they ask.
@@ -536,7 +552,7 @@ Work the pipeline ONE STEP AT A TIME. Before each step, say which step is next a
 6 Ums, ahs and long silences: apply_cuts (mode replace) per the "Default - Talking Head" style guide. Show the count, seconds removed and a few examples. Filler words are often missing from the transcript, so expect the user to check this step.
 7 Repeated phrases and mistakes: apply_cuts (mode add) per the same guide. Show each cut with the words it removes.
 8 Zooms: apply_zooms per "Zooms - Talking Head". Show each zoom with its words.
-9 B-roll: per "B-roll - Talking Head", stock only (Pixabay video, Unsplash photos). First choose all the spots and show them as a list; the user approves the spots. Then go through the spots ONE AT A TIME: for the current spot only, run broll_candidates with a search (up to 40 results), pick your 10 favorites that truly match the words, and show the user a sheet of just those (broll_candidates with ids and a title naming the spot), with each clip's page link and which one you'd pick. Then STOP: The user picks the winner by number, or gives a different phrase to search; for a new phrase, search it and show a new top 10 for the same spot. Place the winner with apply_broll using pixabayId (apply_broll replaces the list, so send every clip picked so far), then move to the next spot. Never search ahead, never show two spots at once, never place a clip the user didn't pick. If a sheet is thin, widen it with also, or ask the user for the link to a clip they see on pixabay.com (a pasted link works in ids and in apply_broll's url). Every clip the user picks is approved: when it's placed, the app copies it into the shared B-roll Library (~/Movies/1Shot/B-roll Library, listed in library.json with credit, page and words) so every project can reuse it, and placing a clip that's already there copies it instead of downloading it again. When the user asks to keep a clip they didn't place (a runner-up), save it with save_to_broll_library. A shot can also be framed: zoom (1–3, 1 = fill) and panX/panY (−1…1) on the shot in apply_broll zoom into it and pick which part shows. A shot can also be picture-in-picture: pipScale (0.15–1, size of the frame) and pipX/pipY (its centre in the 1920×1080 frame, y down) put it in a rounded box over the speaker; the user can also drag it on the video in the B-roll tab. apply_broll replaces the list, so send each shot's pip fields back unchanged. Never use a vertical (portrait) video: horizontal only (the app leaves them off sheets and refuses to place one).
+9 B-roll: per "B-roll - Talking Head", stock or generated (Pixabay video, Unsplash photos, AI clips from vidIQ). ONE REVIEW SHEET FOR THE WHOLE VIDEO, not one spot at a time. (a) Choose all the spots and list them (time, words, length) with the source you plan for each: the shared B-roll Library first (~/Movies/1Shot/B-roll Library/library.json) when the user already approved a clip for the same idea; Pixabay for common scenes and actions; generated video (vidiq_generate_video, minimax-h3, 768p, 16:9) for a feeling on a person's face, people like the viewer that stock lacks, or a scene stock lacks; generated still (vidiq_image_generate) for a scene that needn't move. Never generate real events, products, brands, named people or readable text. STOP: the user approves the spots and sources. (b) Before generating, tell the user the total credits and their vidiq_balance and wait for an OK (one OK per batch; no paid retries without asking). Then do every spot without stopping: Pixabay spots get a broll_candidates search (up to 40) and your 3 best; generated spots all start at once and you poll vidiq_job_poll until done. Prompts follow the guide's generated look so every shot looks like one shoot. (c) Show ONE sheet: broll_candidates with spots (a row per spot, your pick first, up to 2 alternates), with every pick's link, which are generated, and one line per spot on why. STOP: the user names only the spots to change (e.g. 3B, skip 5, a pasted pixabay.com link, a new search, generate 4 instead); everything else is approved as A. Redo only those, then place everything in ONE apply_broll call (pixabayId for Pixabay; url or file plus generated: true and prompt for generated clips). Never place a clip the user hasn't seen on a sheet. Every placed clip goes into the shared B-roll Library automatically (generated ones too); placing one that's already there copies it instead of downloading. When the user asks to keep a clip they didn't place (a runner-up), save it with save_to_broll_library. A shot can also be framed: zoom (1–3, 1 = fill) and panX/panY (−1…1) on the shot in apply_broll zoom into it and pick which part shows. A shot can also be picture-in-picture: pipScale (0.15–1, size of the frame) and pipX/pipY (its centre in the 1920×1080 frame, y down) put it in a rounded box over the speaker; the user can also drag it on the video in the B-roll tab. Photos are still by default; push: true on a photo gives it a slow 100→108% push-in. Photos show whole at their own shape, uncropped, over the speaker (who shows around them and through a PNG's transparency); fit: false crops a photo to fill the frame, fit: true does the same whole-picture look for a video. For a whole-picture shot, pipScale is its size (1 = as big as fits the frame, up to 4), pipX/pipY its centre and rotation its turn in degrees clockwise; no box or shadow is added. apply_broll replaces the list, so send each shot's pip, rotation, push and fit fields back unchanged. Never use a vertical (portrait) video: horizontal only (the app leaves them off sheets and refuses to place one).
 10 Motion Graphics (playful style: elements animate beside the speaker; full-screen only for the 1–2 biggest points; about one plate every 15–20 s): graphics_templates first. From the transcript, choose spots and propose plates (template, words, the red word marked with *asterisks*, side opposite the speaker for overlays, builds on the words for bullets). Show them with graphics_preview and list each with its time and words; stop for the user's picks and edits. Then apply_graphics with only what they approved, and stop for approval. For size or position tweaks after that, use adjust_graphics (one plate) or graphics_style (all plates); both are instant. Charts and numbers use the user's real numbers only: ask, never make them up. Keep plates off the speaker's face unless it's a deliberate comedic beat. The app does not check the face: plates go exactly where side, scale and dx/dy put them, so pick the side away from the speaker and check the preview sheet; the user fine-tunes size and position in the Graphics tab. Always include a name plate: a lowerThird with the user's channel handle as title and their tagline as subtitle, in the first 10–15 s of the edited video. Ask the user for the handle and tagline if you don't know them; never guess.
 11 Export: not available in this version yet. The user exports with ⌘Y; its save sheet has a "Normalize loudness to −14 LUFS" checkbox (on by default).
 

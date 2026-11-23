@@ -339,7 +339,7 @@ extension PlayerWindowController {
         // Follow along (2026-11-11): each pipeline step switches the app to its own tab,
         // so the panel and timeline show what Claude just changed.
         let stepTab: [String: WorkspaceTab] = [
-            "find_dead_air": .assets, "set_clip_trims": .assets,
+            "find_dead_air": .assets, "set_clip_trims": .assets, "set_clip_order": .assets,
             "compare_clips": .assets, "set_clip_groups": .assets,
             "set_visual": .visualDesign, "set_sound": .soundDesign,
             "apply_cuts": .cuts, "apply_zooms": .zooms,
@@ -360,6 +360,7 @@ extension PlayerWindowController {
             case "set_trim":          done(.success(try mcpSetTrim(args)))
             case "find_dead_air":     try mcpFindDeadAir(args, done)
             case "set_clip_trims":    try mcpSetClipTrims(args, done)
+            case "set_clip_order":    try mcpSetClipOrder(args, done)
             case "compare_clips":     try mcpCompareClips(args, done)
             case "set_clip_groups":   done(.success(try mcpSetClipGroups(args)))
             case "create_transcript": try mcpCreateTranscript(args, done)
@@ -931,7 +932,7 @@ extension PlayerWindowController {
 
     // MARK: Clip in/out (3.4.0)
 
-    /// The clips that go into the A-roll, oldest first — the numbering find_dead_air and set_clip_trims use.
+    /// The clips that go into the A-roll, in Assets-list order — the numbering find_dead_air and set_clip_trims use.
     private var mcpIncludedAssets: [AssetEntry] {
         assets.filter { !$0.rejected }.sorted { $0.sortDate < $1.sortDate }
     }
@@ -955,7 +956,7 @@ extension PlayerWindowController {
         if let list = args["clips"] as? [Any] {
             wanted = try list.map {
                 guard let n = MCP.num($0), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
-                    throw MCPError("clips are numbers 1–\(included.count) (oldest first).")
+                    throw MCPError("clips are numbers 1–\(included.count) (in Assets-list order).")
                 }
                 return Int(n)
             }
@@ -1009,13 +1010,13 @@ extension PlayerWindowController {
         let included = mcpIncludedAssets
         guard !included.isEmpty else { throw MCPError("This project has no clips in the Assets tab.") }
         guard let list = args["clips"] as? [[String: Any]], !list.isEmpty else {
-            throw MCPError("clips is a list of {clip, in, out}, with clip numbered 1–\(included.count) (oldest first).")
+            throw MCPError("clips is a list of {clip, in, out}, with clip numbered 1–\(included.count) (in Assets-list order).")
         }
         var updated = assets
         var touched = Set<UUID>()
         for item in list {
             guard let n = MCP.num(item["clip"]), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
-                throw MCPError("clip is a number 1–\(included.count) (oldest first).")
+                throw MCPError("clip is a number 1–\(included.count) (in Assets-list order).")
             }
             let entry = included[Int(n) - 1]
             guard let idx = updated.firstIndex(where: { $0.id == entry.id }) else { continue }
@@ -1046,6 +1047,49 @@ extension PlayerWindowController {
         applyAssetTrims(updated) { ok in
             if ok { done(.success(answer())) }
             else { done(.failure(MCPError("The clips couldn't be assembled. Nothing was changed."))) }
+        }
+    }
+
+    /// Puts the Assets-tab clips in a new order (3.6.1), the order the A-roll plays them in.
+    /// `order` lists current clip numbers; any left out keep their order after the listed ones.
+    /// Rebuilds the A-roll if one is open (refusing, without clearEdits, if it has edits).
+    private func mcpSetClipOrder(_ args: [String: Any], _ done: @escaping MCPReply) throws {
+        try mcpRequireIdle()
+        guard project != nil else { throw MCPError("Open a project first (open_project).") }
+        let included = mcpIncludedAssets
+        guard included.count > 1 else { throw MCPError("There's nothing to reorder: the project needs two or more clips in the Assets tab.") }
+        guard let raw = args["order"] as? [Any], !raw.isEmpty else {
+            throw MCPError("order is a list of clip numbers 1–\(included.count), in the order they should play.")
+        }
+        var seen = Set<Int>()
+        let nums = try raw.map { v -> Int in
+            guard let n = MCP.num(v), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
+                throw MCPError("Clips are numbers 1–\(included.count) (the current order).")
+            }
+            guard seen.insert(Int(n)).inserted else { throw MCPError("Clip \(Int(n)) is listed twice.") }
+            return Int(n)
+        }
+        let first = nums.map { included[$0 - 1].id }
+        let rest = included.map(\.id).filter { !first.contains($0) }
+        let rejected = assets.filter(\.rejected).map(\.id)
+        let newOrder = first + rest
+        let changed = newOrder != included.map(\.id)
+        let built = selectedAssetID == nil && arollRecipe != nil
+        let hasEdits = !cuts.isEmpty || !zooms.isEmpty || !broll.isEmpty || !graphics.isEmpty
+        if changed, built, hasEdits, args["clearEdits"] as? Bool != true {
+            throw MCPError("The A-roll already has cuts, zooms, B-roll or graphics. Reordering the clips moves the timeline and clears them all. Ask the user; if they agree, call again with clearEdits: true.")
+        }
+        func answer() -> [String: Any] {
+            ["clips": mcpIncludedAssets.enumerated().map { mcpClipJSON($1, index: $0 + 1) },
+             "changed": changed, "rebuilt": changed && built,
+             "note": built || !changed ? "" : "The A-roll isn't built yet: the user (or set_clip_trims) builds it in this order."]
+        }
+        guard changed else { done(.success(answer())); return }
+        reorderAssets(newOrder + rejected)
+        guard built else { done(.success(answer())); return }
+        applyAssetTrims(assets) { ok in
+            if ok { done(.success(answer())) }
+            else { done(.failure(MCPError("The clips couldn't be assembled in the new order."))) }
         }
     }
 
@@ -1107,7 +1151,7 @@ extension PlayerWindowController {
         let included = mcpIncludedAssets
         guard !included.isEmpty else { throw MCPError("This project has no clips in the Assets tab.") }
         guard let list = args["groups"] as? [[String: Any]], !list.isEmpty else {
-            throw MCPError("groups is a list of {name, clips}, with clips numbered 1–\(included.count) (oldest first).")
+            throw MCPError("groups is a list of {name, clips}, with clips numbered 1–\(included.count) (in Assets-list order).")
         }
         var seen = Set<Int>()
         var plan: [(name: String, clips: [Int])] = []
@@ -1116,7 +1160,7 @@ extension PlayerWindowController {
             guard let raw = g["clips"] as? [Any], !raw.isEmpty else { throw MCPError("Every group needs clips (numbers 1–\(included.count)).") }
             let nums = try raw.map { v -> Int in
                 guard let n = MCP.num(v), n == n.rounded(), Int(n) >= 1, Int(n) <= included.count else {
-                    throw MCPError("Clips are numbers 1–\(included.count) (oldest first).")
+                    throw MCPError("Clips are numbers 1–\(included.count) (in Assets-list order).")
                 }
                 guard seen.insert(Int(n)).inserted else { throw MCPError("Clip \(Int(n)) is in more than one group.") }
                 return Int(n)
@@ -1418,14 +1462,26 @@ extension PlayerWindowController {
             }
         }
         // Stock-only policy (2026-11-09): nothing from their own drive or Movies folder for now.
-        if let items = MCP.object(in: text)?["broll"] as? [[String: Any]] {
-            if let own = items.first(where: { $0["file"] != nil }) {
-                throw MCPError("B-roll is stock only for now (Pixabay video, Unsplash photos). Remove “file” from the shot at \(MCP.num(own["at"]).map { MCP.tc($0) } ?? "?").")
+        if var items = MCP.object(in: text)?["broll"] as? [[String: Any]] {
+            // Generated B-roll (3.6) is finished footage, so it may come from a file; the user's own footage may not.
+            if let own = items.first(where: { $0["file"] != nil && ($0["generated"] as? Bool) != true }) {
+                throw MCPError("B-roll is stock or generated only for now (no footage of your own). Remove “file” from the shot at \(MCP.num(own["at"]).map { MCP.tc($0) } ?? "?"), or mark it generated: true if an AI service or Claude made it.")
+            }
+            if let missing = items.first(where: { item in
+                guard let f = item["file"] as? String else { return false }
+                return !FileManager.default.fileExists(atPath: (f as NSString).expandingTildeInPath)
+            }) {
+                throw MCPError("There's no file at \(missing["file"] as? String ?? "?") (shot at \(MCP.num(missing["at"]).map { MCP.tc($0) } ?? "?")).")
             }
             if let bad = items.first(where: { item in
-                ["search", "url", "pixabayId"].filter { item[$0] != nil && !(item[$0] is NSNull) }.count != 1
+                ["search", "url", "pixabayId", "file"].filter { item[$0] != nil && !(item[$0] is NSNull) }.count != 1
             }) {
-                throw MCPError("Each shot needs exactly one of pixabayId (a video picked from a candidate sheet), search (Pixabay's top match) or url (Unsplash photo). Check the shot at \(MCP.num(bad["at"]).map { MCP.tc($0) } ?? "?").")
+                throw MCPError("Each shot needs exactly one of pixabayId (a video picked from a candidate sheet), search (Pixabay's top match), url (Unsplash photo, or a generated clip's link) or file (a generated clip on this Mac). Check the shot at \(MCP.num(bad["at"]).map { MCP.tc($0) } ?? "?").")
+            }
+            for i in items.indices { if let f = items[i]["file"] as? String { items[i]["file"] = (f as NSString).expandingTildeInPath } }
+            if var obj = MCP.object(in: text) {
+                obj["broll"] = items
+                if let data = try? JSONSerialization.data(withJSONObject: obj), let t = String(data: data, encoding: .utf8) { text = t }
             }
         }
         let incoming = try BrollList.parse(text)
@@ -1458,7 +1514,8 @@ extension PlayerWindowController {
                 ["at": MCP.r(c.at), "atTC": MCP.tc(c.at), "length": MCP.r(c.length), "kind": c.kind,
                  "search": MCP.orNull(c.search), "url": MCP.orNull(c.url), "pixabayId": MCP.orNull(c.pixabayId),
                  "downloaded": c.file != nil, "file": MCP.orNull(c.file), "credit": MCP.orNull(c.credit),
-                 "words": MCP.orNull(c.words), "yours": c.reason == "manual"]
+                 "words": MCP.orNull(c.words), "yours": c.reason == "manual",
+                 "generated": c.isGenerated, "prompt": MCP.orNull(c.prompt)]
             }
         ]
         if !problems.isEmpty { out["problems"] = problems }
@@ -1494,6 +1551,10 @@ extension PlayerWindowController {
             return MCP.num(item).map { Int($0) }
         } ?? []
         let also = (args["also"] as? [Any])?.compactMap { $0 as? String } ?? []
+        if let spots = args["spots"] as? [[String: Any]], !spots.isEmpty {
+            try mcpBrollReviewSheet(spots, title: (args["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Whole video", done)
+            return
+        }
         guard !search.isEmpty || !ids.isEmpty else {
             throw MCPError("Pass search (words to look for on Pixabay) or ids (Pixabay video ids or links, in the order to show them).")
         }
@@ -1531,6 +1592,86 @@ extension PlayerWindowController {
             } catch {
                 done(.failure(error))
             }
+        }
+    }
+
+    // MARK: Whole-video B-roll review sheet (3.6)
+
+    /// One sheet for every spot: a row per spot, my pick first (outlined), alternates after it.
+    /// Picks may be Pixabay ids or links, generated clips on this Mac (file paths) or links to them.
+    private func mcpBrollReviewSheet(_ spots: [[String: Any]], title: String, _ done: @escaping MCPReply) throws {
+        struct Pick { let label: String; let raw: Any; let kind: String }
+        var rows: [(title: String, picks: [Pick])] = []
+        for (si, spot) in spots.enumerated() {
+            let picks = (spot["picks"] as? [Any]) ?? []
+            guard !picks.isEmpty else { throw MCPError("Spot \(si + 1) has no picks. Give each spot picks: [your pick first, then alternates].") }
+            var spotTitle = (spot["title"] as? String) ?? ""
+            if spotTitle.isEmpty, let at = MCP.num(spot["at"]) { spotTitle = MCP.tc(at) + " " + ((spot["words"] as? String) ?? "") }
+            let letters = Array("ABCDEFGHIJ")
+            rows.append((spotTitle, picks.prefix(letters.count).enumerated().map { pi, p in
+                let label = "\(si + 1)\(letters[pi])"
+                if let s = p as? String {
+                    if BrollFetch.pixabayId(fromLink: s) != nil { return Pick(label: label, raw: s, kind: "pixabay") }
+                    if s.hasPrefix("/") || s.hasPrefix("~") { return Pick(label: label, raw: (s as NSString).expandingTildeInPath, kind: "file") }
+                    if Int(s) != nil { return Pick(label: label, raw: s, kind: "pixabay") }
+                    return Pick(label: label, raw: s, kind: "url")
+                }
+                return Pick(label: label, raw: p, kind: "pixabay")
+            }))
+        }
+        let folder = project?.folder.appendingPathComponent("B-roll Candidates", isDirectory: true)
+        Task { @MainActor in
+            // Look up every Pixabay pick in one go.
+            let allIds: [Int] = rows.flatMap { $0.picks }.compactMap { p in
+                guard p.kind == "pixabay" else { return nil }
+                if let s = p.raw as? String { return BrollFetch.pixabayId(fromLink: s) ?? Int(s) }
+                return MCP.num(p.raw).map { Int($0) }
+            }
+            let found = await BrollFetch.pixabayCandidates(ids: Array(Set(allIds)))
+            let byId = Dictionary(found.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            var sheetRows: [(String, [CandidateSheet.Tile])] = []
+            var listing: [[String: Any]] = []
+            for (title, picks) in rows {
+                var tiles: [CandidateSheet.Tile] = []
+                var entries: [[String: Any]] = []
+                for p in picks {
+                    switch p.kind {
+                    case "pixabay":
+                        let id = (p.raw as? String).flatMap { BrollFetch.pixabayId(fromLink: $0) ?? Int($0) } ?? MCP.num(p.raw).map { Int($0) } ?? 0
+                        guard let c = byId[id] else { entries.append(["label": p.label, "pixabayId": id, "problem": "not found on Pixabay (or vertical)"]); continue }
+                        tiles.append(.init(label: p.label, caption: "Pixabay \(c.duration) s · \(c.tags)", source: .remote(c.thumbnail)))
+                        entries.append(["label": p.label, "pixabayId": id, "page": c.pageURL, "seconds": c.duration])
+                    case "file":
+                        let path = p.raw as? String ?? ""
+                        let url = URL(fileURLWithPath: path)
+                        guard FileManager.default.fileExists(atPath: path) else { entries.append(["label": p.label, "file": path, "problem": "no file there"]); continue }
+                        tiles.append(.init(label: p.label, caption: "Generated · " + url.lastPathComponent, source: .file(url)))
+                        entries.append(["label": p.label, "file": path, "generated": true])
+                    default:
+                        let s = p.raw as? String ?? ""
+                        tiles.append(.init(label: p.label, caption: "Link · " + (URL(string: s)?.host ?? s), source: .remote(URL(string: s))))
+                        entries.append(["label": p.label, "url": s])
+                    }
+                }
+                sheetRows.append((title, tiles))
+                listing.append(["spot": title, "picks": entries])
+            }
+            guard let sheet = await CandidateSheet.makeReview(sheetRows, title: title) else {
+                done(.failure(MCPError("Couldn't draw the review sheet."))); return
+            }
+            var out: [String: Any] = [
+                "spots": listing,
+                "howToUse": "Each row is one spot; A (outlined) is your pick, B, C… are alternates. Show the user the sheet with every pick's link and ask them to name only the spots to change (e.g. 3B, or a new idea for spot 5). Place everything at once with apply_broll: Pixabay picks as pixabayId; generated clips as file or url with generated: true and the prompt."
+            ]
+            if let folder {
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let name = title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+                let file = folder.appendingPathComponent(name + ".jpg")
+                if (try? sheet.data.write(to: file)) != nil { out["sheet"] = file.path }
+            }
+            out["image"] = ["mimeType": "image/jpeg", "data": sheet.data.base64EncodedString(),
+                            "width": sheet.width, "height": sheet.height] as [String: Any]
+            done(.success(out))
         }
     }
 
@@ -1876,6 +2017,110 @@ enum Loudness {
 
 /// A numbered grid of Pixabay thumbnails (number, length, tags under each), as a JPEG.
 enum CandidateSheet {
+    struct Tile {
+        enum Source { case remote(URL?), file(URL) }
+        let label: String; let caption: String; let source: Source
+    }
+
+    /// A still for a tile: a downloaded or local image, or a frame 1 s into a video (local or remote).
+    static func image(for source: Tile.Source) async -> CGImage? {
+        func still(_ asset: AVURLAsset) async -> CGImage? {
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 640, height: 360)
+            if let got = try? await gen.image(at: CMTime(seconds: 1, preferredTimescale: 600)) { return got.image }
+            return try? await gen.image(at: .zero).image
+        }
+        func decode(_ data: Data) -> CGImage? {
+            guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+            return CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
+        }
+        switch source {
+        case .file(let url):
+            if BrollList.isPhotoFile(url), let d = try? Data(contentsOf: url) { return decode(d) }
+            return await still(AVURLAsset(url: url))
+        case .remote(let url):
+            guard let url else { return nil }
+            if BrollList.isVideoFile(url) { return await still(AVURLAsset(url: url)) }
+            if let (d, _) = try? await URLSession.shared.data(from: url), let img = decode(d) { return img }
+            return await still(AVURLAsset(url: url))
+        }
+    }
+
+    /// The whole-video review sheet: one titled row per spot, the first tile (my pick) outlined.
+    static func makeReview(_ rows: [(String, [Tile])], title: String) async -> (data: Data, width: Int, height: Int)? {
+        let tiles = rows.flatMap { $0.1 }
+        let images: [Int: CGImage] = await withTaskGroup(of: (Int, CGImage?).self) { group in
+            for (i, t) in tiles.enumerated() { group.addTask { (i, await image(for: t.source)) } }
+            var out: [Int: CGImage] = [:]
+            for await (i, img) in group { if let img { out[i] = img } }
+            return out
+        }
+        let tw = 240, th = 135, gap = 10, caption = 30, header = 44, rowTitle = 26
+        let cols = min(5, max(3, rows.map { $0.1.count }.max() ?? 3))
+        let rowHeights = rows.map { r in rowTitle + max(1, (r.1.count + cols - 1) / cols) * (th + caption + gap) }
+        let width = cols * tw + (cols + 1) * gap
+        let height = header + rowHeights.reduce(0, +) + gap
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 0.12, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSAttributedString(string: "B-roll review: \(title)", attributes: [.font: NSFont.systemFont(ofSize: 18, weight: .semibold),
+                                                                         .foregroundColor: NSColor.white])
+            .draw(at: NSPoint(x: gap, y: height - header + 12))
+        let rowAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+                                                       .foregroundColor: NSColor(white: 0.95, alpha: 1)]
+        let numberAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 16, weight: .bold), .foregroundColor: NSColor.white]
+        let captionAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor(white: 0.8, alpha: 1)]
+        var top = height - header
+        var index = 0
+        for (ri, row) in rows.enumerated() {
+            NSAttributedString(string: "\(ri + 1)  ·  \(row.0)", attributes: rowAttrs)
+                .draw(with: NSRect(x: gap, y: top - rowTitle + 4, width: width - 2 * gap, height: rowTitle - 4),
+                      options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            let tilesTop = top - rowTitle
+            for (pi, t) in row.1.enumerated() {
+                let col = pi % cols, r = pi / cols
+                let x = gap + col * (tw + gap)
+                let tTop = tilesTop - r * (th + caption + gap)
+                let rect = CGRect(x: x, y: tTop - th, width: tw, height: th)
+                ctx.setFillColor(CGColor(gray: 0.2, alpha: 1))
+                ctx.fill(rect)
+                if let img = images[index] {
+                    let k = max(CGFloat(tw) / CGFloat(img.width), CGFloat(th) / CGFloat(img.height))
+                    let w = CGFloat(img.width) * k, h = CGFloat(img.height) * k
+                    ctx.saveGState(); ctx.clip(to: rect); ctx.interpolationQuality = .high
+                    ctx.draw(img, in: CGRect(x: rect.midX - w / 2, y: rect.midY - h / 2, width: w, height: h))
+                    ctx.restoreGState()
+                }
+                if pi == 0 {   // my pick
+                    ctx.setStrokeColor(CGColor(red: 1, green: 0.78, blue: 0.2, alpha: 1))
+                    ctx.setLineWidth(4)
+                    ctx.stroke(rect.insetBy(dx: 2, dy: 2))
+                }
+                let label = NSAttributedString(string: t.label, attributes: numberAttrs)
+                let size = label.size()
+                let badge = CGRect(x: rect.minX + 6, y: rect.maxY - size.height - 10, width: size.width + 14, height: size.height + 4)
+                ctx.setFillColor(CGColor(gray: 0, alpha: 0.7)); ctx.fill(badge)
+                label.draw(at: NSPoint(x: badge.minX + 7, y: badge.minY + 2))
+                NSAttributedString(string: t.caption, attributes: captionAttrs)
+                    .draw(with: NSRect(x: rect.minX, y: rect.minY - CGFloat(caption) + 2, width: CGFloat(tw), height: CGFloat(caption - 4)),
+                          options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+                index += 1
+            }
+            top -= rowHeights[ri]
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = ctx.makeImage(),
+              let data = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+        else { return nil }
+        return (data, width, height)
+    }
+
     static func make(_ items: [BrollFetch.Candidate], title: String) async -> (data: Data, width: Int, height: Int)? {
         // Thumbnails, fetched in parallel.
         let thumbs: [Int: Data] = await withTaskGroup(of: (Int, Data?).self) { group in

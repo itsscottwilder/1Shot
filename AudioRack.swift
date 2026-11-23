@@ -58,6 +58,9 @@ final class AudioFeeder {
     var onBuffer: (() -> Void)?
     /// Fade-out end time (media seconds); audio fades to silence over the 0.5 s before it.
     var fadeEnd: Double?
+    /// A1 section levels (3.7.0) and the map from this feeder's clock (the edited timeline) to clip time.
+    var volume: VolumeMap?
+    var toClip: ((Double) -> Double)?
 
     private var cancelled: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -107,6 +110,9 @@ final class AudioFeeder {
         while true {
             guard let sample = output.copyNextSampleBuffer() else { return nil }
             guard let buffer = Self.pcmBuffer(from: sample, format: format) else { continue }
+            if let volume {
+                volume.apply(to: buffer, startingAt: CMSampleBufferGetPresentationTimeStamp(sample).seconds, toClip: toClip)
+            }
             if let fadeEnd {
                 Self.applyFadeOut(to: buffer, startingAt: CMSampleBufferGetPresentationTimeStamp(sample).seconds,
                                   fadeEnd: fadeEnd)
@@ -284,6 +290,19 @@ final class AudioRack {
 
     /// Audio fade-out end (media seconds), matching the picture's fade to black. nil = no fade.
     private(set) var fadeOutEnd: Double?
+
+    /// A1 section levels (3.7.0), and the cuts the player is built with (its clock skips them).
+    private(set) var volumeMap = VolumeMap()
+    private var volumeCuts: [Cut] = []
+
+    func setVolume(_ map: VolumeMap, cuts: [Cut]) {
+        guard map != volumeMap || cuts != volumeCuts else { return }
+        volumeMap = map
+        volumeCuts = cuts
+        if !isExporting, audioRunning, let player {
+            restartAudio(at: player.currentTime().seconds)
+        }
+    }
 
     func setFadeOut(end: Double?) {
         guard end != fadeOutEnd else { return }
@@ -932,6 +951,11 @@ final class AudioRack {
         }
         f.onBuffer = { [weak self] in self?.processedBlocks &+= 1 }
         f.fadeEnd = fadeOutEnd
+        if !volumeMap.isFlat {
+            let cuts = volumeCuts
+            f.volume = volumeMap
+            f.toClip = cuts.isEmpty ? nil : { CutList.sourceTime($0, cuts: cuts) }
+        }
         feeder = f
         appliedLead = lead
         startOffset = max(0, audioStart)

@@ -252,12 +252,21 @@ final class ColorGrade {
                 var shot = b
                 if var g = self.groupGrade(group), !g.isNeutral {
                     if bypass { g.settings = ColorGrade.bypassedSettings(g.settings) }
-                    shot = ColorGrade.grade(b, g.settings, lut: g.lut, creativeLUT: g.creativeLUT)
+                    // Grade the colours on their own (alpha set to 1), then put the shot's own
+                    // transparency back, so a look never tints a PNG's see-through parts (3.7.3).
+                    let opaque = b.unpremultiplyingAlpha().applyingFilter("CIColorMatrix", parameters: [
+                        "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                        "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 1)])
+                    let gradedShot = ColorGrade.grade(opaque, g.settings, lut: g.lut, creativeLUT: g.creativeLUT)
+                    shot = gradedShot.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                        kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: b]).cropped(to: frame)
                 }
                 if let pip {
                     graded = BrollRenderer.placeInPicture(shot, pip, extent: frame).composited(over: graded)
                 } else {
-                    graded = shot
+                    // Over the talking head, so a transparent PNG (or a whole picture that doesn't
+                    // fill the frame) shows the speaker around it (3.7.3). Opaque shots cover it all.
+                    graded = shot.composited(over: graded).cropped(to: frame)
                 }
             }
 
