@@ -831,10 +831,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     @MainActor
     private func runExport(asset: AVAsset, to url: URL, trim: (start: Double, end: Double)?, normalize: Bool,
                            recipe: ExportRecipe = .current) async {
-        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first else {
-            showAlert("Nothing to export", "This video has no audio track.")
-            return
-        }
+        // A clip with no sound still exports (3.5.2): picture plus a silent track, no normalizing.
+        let audioTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first
+        let normalize = normalize && audioTrack != nil
         let videoTrack = try? await asset.loadTracks(withMediaType: .video).first
         var transform = CGAffineTransform.identity
         var size = CGSize(width: 1920, height: 1080)
@@ -873,7 +872,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             sheet.onCancel = { flag.set() }
             loudnessScanRunning = true
             do {
-                plan = try await normalizationPlan(asset: asset, track: audioTrack, start: start, end: end,
+                plan = try await normalizationPlan(asset: asset, track: audioTrack!, start: start, end: end,
                                                    cuts: cutList, fadeEnd: fadeEnd, drive: drive, flag: flag, sheet: sheet)
                 loudnessScanRunning = false
             } catch {

@@ -107,10 +107,15 @@ final class BrollRenderer {
     private var _shots: [Shot] = []
     private var _cuts: [Cut] = []
     private var generators: [URL: AVAssetImageGenerator] = [:]
+    private var readers: [URL: BrollReader] = [:]   // 3.5.2: in-order playback (see BrollReader)
     private var photos: [URL: CIImage] = [:]
 
     func update(shots: [Shot], cuts: [Cut]) {
-        lock.lock(); _shots = shots; _cuts = cuts; lock.unlock()
+        lock.lock()
+        _shots = shots; _cuts = cuts
+        let inUse = Set(shots.map(\.url))
+        readers = readers.filter { inUse.contains($0.key) }   // let go of clips no longer on the timeline
+        lock.unlock()
     }
 
     /// The B-roll picture for clip time `t`, filling `extent`, or nil when no B-roll is on.
@@ -180,6 +185,11 @@ final class BrollRenderer {
 
     private func frame(_ url: URL, at seconds: Double, extent: CGRect) -> CIImage? {
         lock.lock()
+        let reader: BrollReader
+        let maxSize = CGSize(width: extent.width * 1.2, height: extent.height * 1.2)
+        if let r = readers[url], r.maxSize == maxSize { reader = r } else {
+            reader = BrollReader(url: url, maxSize: maxSize)   // new, or the edit's frame size changed
+            readers[url] = reader }
         let gen: AVAssetImageGenerator
         if let g = generators[url] { gen = g } else {
             gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
@@ -192,6 +202,9 @@ final class BrollRenderer {
         lock.unlock()
         let duration = gen.asset.duration.seconds
         let t = duration.isFinite && duration > 0.1 ? min(seconds, duration - 0.05) : seconds
+        // Playing or exporting: the next frame from a reader already rolling through the clip.
+        // Anything else (a paused frame, scrubbing, a jump): one picture from the generator.
+        if let img = reader.frame(at: max(0, t)) { return img }
         guard let cg = try? gen.copyCGImage(at: CMTime(seconds: max(0, t), preferredTimescale: 600), actualTime: nil)
         else { return nil }
         return CIImage(cgImage: cg)

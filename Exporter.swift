@@ -19,7 +19,7 @@ final class VideoExporter {
 
     struct Source {
         let asset: AVAsset
-        let audioTrack: AVAssetTrack
+        let audioTrack: AVAssetTrack?   // nil: the clip has no sound; the file gets a silent track (3.5.2)
         let videoTrack: AVAssetTrack?
         let videoTransform: CGAffineTransform
         let videoSize: CGSize          // as stored (before rotation)
@@ -63,21 +63,31 @@ final class VideoExporter {
 
     /// Call on the main thread. `completion` runs on the main thread (nil error = success).
     func start(completion: @escaping (Error?) -> Void) {
+        // No sound in the clip: nothing goes through Sound Design. The file still gets a silent
+        // stereo track, so players and YouTube treat it like any other video.
+        let silent = source.audioTrack == nil
         let format: AVAudioFormat
-        do {
-            format = try rack.beginOfflineRender(maxFrames: chunk)
-        } catch {
-            rack.endOfflineRender()
-            completion(error)
-            return
+        if silent {
+            guard let f = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2) else {
+                completion(ExportError.message("Couldn't set up the audio format.")); return
+            }
+            format = f
+        } else {
+            do {
+                format = try rack.beginOfflineRender(maxFrames: chunk)
+            } catch {
+                rack.endOfflineRender()
+                completion(error)
+                return
+            }
         }
-        let latencyFrames = AVAudioFramePosition((rack.totalLatency * format.sampleRate).rounded())
+        let latencyFrames = silent ? 0 : AVAudioFramePosition((rack.totalLatency * format.sampleRate).rounded())
         NSLog("1Shot: exporting to \(outputURL.path) (plugin latency \(latencyFrames) frames)")
 
         DispatchQueue.global(qos: .userInitiated).async {
             self.write(format: format, latencyFrames: latencyFrames) { error in
                 DispatchQueue.main.async {
-                    self.rack.endOfflineRender()
+                    if !silent { self.rack.endOfflineRender() }
                     let result: Error? = self.isCancelled ? ExportError.cancelled : error
                     if result != nil { try? FileManager.default.removeItem(at: self.outputURL) }
                     completion(result)
@@ -96,13 +106,16 @@ final class VideoExporter {
             let writer = try AVAssetWriter(outputURL: outputURL, fileType: source.recipe?.fileType ?? .mp4)
             writer.shouldOptimizeForNetworkUse = true
 
-            // Audio source (decoded to float PCM, fed into the plugin chain)
-            let audioReader = try AVAssetReader(asset: source.asset)
-            let audioOut = AVAssetReaderTrackOutput(track: source.audioTrack,
-                                                    outputSettings: AudioFeeder.readerSettings(for: format))
-            audioOut.alwaysCopiesSampleData = false
-            guard audioReader.canAdd(audioOut) else { throw ExportError.message("Can't read the audio track.") }
-            audioReader.add(audioOut)
+            // Audio source (decoded to float PCM, fed into the plugin chain); none for a silent clip.
+            var audioSource: (reader: AVAssetReader, output: AVAssetReaderTrackOutput)?
+            if let track = source.audioTrack {
+                let audioReader = try AVAssetReader(asset: source.asset)
+                let audioOut = AVAssetReaderTrackOutput(track: track, outputSettings: AudioFeeder.readerSettings(for: format))
+                audioOut.alwaysCopiesSampleData = false
+                guard audioReader.canAdd(audioOut) else { throw ExportError.message("Can't read the audio track.") }
+                audioReader.add(audioOut)
+                audioSource = (audioReader, audioOut)
+            }
 
             // Trim points, on the audio sample clock so audio lines up exactly.
             // The new file's timeline starts at zero (no edit lists).
@@ -117,7 +130,7 @@ final class VideoExporter {
             // Plus any black/silent tail (fade to black adds 2 s after the end).
             let totalFrames = contentFrames + AVAudioFramePosition((max(0, source.tailBlack) * format.sampleRate).rounded())
             let outputDuration = CMTime(value: totalFrames, timescale: rate)
-            audioReader.timeRange = CMTimeRange(start: startTime, duration: .positiveInfinity)
+            audioSource?.reader.timeRange = CMTimeRange(start: startTime, duration: .positiveInfinity)
 
             // Video: decoded and re-encoded as H.264 High profile, CABAC, keyframe every
             // half second, at YouTube's recommended bitrate for the resolution/frame rate.
@@ -210,8 +223,8 @@ final class VideoExporter {
             guard writer.canAdd(audioIn) else { throw ExportError.message("Can't add the audio track.") }
             writer.add(audioIn)
 
-            guard audioReader.startReading() else {
-                throw audioReader.error ?? ExportError.message("Couldn't start reading the audio.")
+            if let audioSource, !audioSource.reader.startReading() {
+                throw audioSource.reader.error ?? ExportError.message("Couldn't start reading the audio.")
             }
             if let video, !video.reader.startReading() {
                 throw video.reader.error ?? ExportError.message("Couldn't start reading the video.")
@@ -317,7 +330,8 @@ final class VideoExporter {
                     if self.isCancelled || self.failure != nil || state.written >= totalFrames { finishAudio(); return }
 
                     // Keep a little decoded audio queued ahead of the renderer.
-                    while !state.sourceEnded && state.scheduled < state.renderedRaw + AVAudioFramePosition(self.chunk) * 4 {
+                    if audioSource == nil { state.sourceEnded = true }
+                    while let audioOut = audioSource?.output, !state.sourceEnded && state.scheduled < state.renderedRaw + AVAudioFramePosition(self.chunk) * 4 {
                         if let sample = audioOut.copyNextSampleBuffer() {
                             if var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) {
                                 let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
@@ -342,10 +356,21 @@ final class VideoExporter {
                     let want = AVAudioFrameCount(min(AVAudioFramePosition(self.chunk), remaining))
 
                     let status: AVAudioEngineManualRenderingStatus
-                    do {
-                        status = try self.rack.renderForExport(want, into: renderBuffer)
-                    } catch {
-                        self.fail(error); finishAudio(); return
+                    if audioSource == nil {
+                        // Silent clip: plain silence, no Sound Design.
+                        renderBuffer.frameLength = want
+                        if let channels = renderBuffer.floatChannelData {
+                            for c in 0..<Int(renderBuffer.format.channelCount) {
+                                channels[c].update(repeating: 0, count: Int(want))
+                            }
+                        }
+                        status = .success
+                    } else {
+                        do {
+                            status = try self.rack.renderForExport(want, into: renderBuffer)
+                        } catch {
+                            self.fail(error); finishAudio(); return
+                        }
                     }
                     if status == .cannotDoInCurrentContext { continue }
                     guard status == .success else {
@@ -389,11 +414,11 @@ final class VideoExporter {
             group.notify(queue: .global(qos: .userInitiated)) {
                 if self.isCancelled || self.failure != nil {
                     writer.cancelWriting()
-                    audioReader.cancelReading()
+                    audioSource?.reader.cancelReading()
                     video?.reader.cancelReading()
                     done(self.failure ?? ExportError.cancelled)
                 } else {
-                    self.finalLoudness = loudness.reading()
+                    self.finalLoudness = audioSource == nil ? nil : loudness.reading()
                     writer.endSession(atSourceTime: outputDuration)
                     writer.finishWriting {
                         done(writer.status == .completed ? nil
