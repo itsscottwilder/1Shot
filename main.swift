@@ -233,11 +233,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             self.player?.pause()
             let resume = finished && self.resumeAfterScrub
             if finished { self.scrubInProgress = false; self.resumeAfterScrub = false }
-            self.player?.seek(to: CMTime(seconds: self.toComp(time), preferredTimescale: 600),
-                               toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] done in
-                guard done, resume else { return }
-                DispatchQueue.main.async { self?.player?.play() }
-            }
+            self.chaseSeek(to: CMTime(seconds: self.toComp(time), preferredTimescale: 600),
+                           then: resume ? { [weak self] in self?.player?.play() } : nil)
         }
 
         // Right panel (3.0.0): a permanent sidebar whose content follows the selected tab.
@@ -623,7 +620,9 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             let source = self.toSource(t.seconds)      // player time → original-clip time
             self.overlay.text = TrimBar.format(source)
             self.trimBar.isPlaying = (self.player?.rate ?? 0) != 0
-            self.trimBar.playhead = source
+            // Dragging the playhead: a scrub seek that lands after the mouse moved on mustn't pull
+            // the line back. (A trim-handle drag still moves it with the frame, as before.)
+            if !(self.trimBar.isScrubbing && self.chaseTarget != nil) { self.trimBar.playhead = source }
             if self.currentTab == .graphics { self.updatePlateHandles() }
             if self.currentTab == .broll { self.updateBrollHandles() }
         }
@@ -2617,7 +2616,45 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         // Preview the frame under the handle; when you let go of the end handle, park at the start.
         if finished { updateFade() }
         let target = (movingStart || finished) ? start : end
+        // Plain seek, as in 3.8.4: one-seek-at-a-time (chaseSeek) is used for scrubbing only for now.
         p.seek(to: CMTime(seconds: toComp(target), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    // MARK: Scrubbing (one seek at a time) — from PR #1
+
+    private var chaseTarget: CMTime?
+    private var chaseThen: (() -> Void)?
+    private weak var chasePlayer: AVPlayer?      // the player with a scrub seek in flight (nil = none)
+
+    /// Seeks exactly to `time` for a playhead scrub. Only one seek runs at a time:
+    /// while it does, the newest place asked for is remembered and sought as soon as it lands.
+    /// A new exact seek on every mouse event instead cancels the one before it, so on heavy
+    /// footage the picture doesn't update until the mouse stops.
+    /// `then` runs after the seek to `time` finishes, unless a newer request replaced it.
+    func chaseSeek(to time: CMTime, then: (() -> Void)? = nil) {
+        chaseTarget = time
+        chaseThen = then
+        if let busy = chasePlayer, busy === player { return }
+        runChaseSeek()
+    }
+
+    private func runChaseSeek() {
+        guard let p = player, let target = chaseTarget else {
+            chasePlayer = nil; chaseTarget = nil; chaseThen = nil      // nothing to seek: don't leave a target waiting
+            return
+        }
+        let then = chaseThen
+        chaseTarget = nil
+        chaseThen = nil
+        chasePlayer = p
+        p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak p] finished in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.chasePlayer === p { self.chasePlayer = nil }
+                if self.chaseTarget != nil { self.runChaseSeek() }      // the mouse moved on meanwhile
+                else if finished { then?() }
+            }
+        }
     }
 
     /// Sets the player's in/out points (original-clip times → edited timeline).
@@ -4077,3 +4114,4 @@ enum RecentFiles {
         UserDefaults.standard.set(paths, forKey: key)
     }
 }
+

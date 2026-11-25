@@ -442,6 +442,12 @@ final class TrimBar: NSView {
         addSubview(overviewTick)
     }
 
+    /// The playhead itself is being dragged (scrubbing).
+    var isScrubbing: Bool {
+        if case .playhead = drag { return true }
+        return false
+    }
+
     private var isDragging: Bool {
         if case .none = drag { return false }
         return true
