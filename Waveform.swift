@@ -70,7 +70,7 @@ final class WaveformData {
 
     /// Calls `body` with each buffer of mono float samples, in order.
     private static func forEachBuffer(_ output: AVAssetReaderTrackOutput, _ body: (UnsafeBufferPointer<Float>) -> Void) {
-        while let sample = output.copyNextSampleBuffer() {
+        while let sample = autoreleasepool(invoking: { output.copyNextSampleBuffer() }) {
             guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
             var lengthAtOffset = 0, total = 0
             var pointer: UnsafeMutablePointer<CChar>?

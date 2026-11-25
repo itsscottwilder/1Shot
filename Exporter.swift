@@ -274,44 +274,50 @@ final class VideoExporter {
                 videoIn.requestMediaDataWhenReady(on: DispatchQueue(label: "1Shot.export.video")) {
                     guard !state.videoFinished else { return }
                     while videoIn.isReadyForMoreMediaData {
-                        if self.isCancelled || self.failure != nil { finishVideo(); return }
-                        if state.contentDone {
-                            guard let black, state.blackTime < outputDuration else { finishVideo(); return }
-                            if !adaptor.append(black, withPresentationTime: state.blackTime) {
-                                self.fail(Self.describe(writer.error, stage: "adding the black ending"))
-                                finishVideo(); return
+                        // One frame per pool, so nothing made along the way outlives its frame
+                        // (this loop can run for a long time without returning). False = stop.
+                        let carryOn: Bool = autoreleasepool {
+                            if self.isCancelled || self.failure != nil { finishVideo(); return false }
+                            if state.contentDone {
+                                guard let black, state.blackTime < outputDuration else { finishVideo(); return false }
+                                if !adaptor.append(black, withPresentationTime: state.blackTime) {
+                                    self.fail(Self.describe(writer.error, stage: "adding the black ending"))
+                                    finishVideo(); return false
+                                }
+                                state.blackTime = CMTimeAdd(state.blackTime, frameStep)
+                                return true
                             }
-                            state.blackTime = CMTimeAdd(state.blackTime, frameStep)
-                            continue
+                            guard let sample = videoOut.copyNextSampleBuffer() else { state.contentDone = true; return true }
+                            guard let pixels = CMSampleBufferGetImageBuffer(sample) else { return true }
+                            // Shift onto the new timeline that starts at zero, closing up any cuts.
+                            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                            var time = CMTimeSubtract(pts, startTime)
+                            if !cuts.isEmpty {
+                                let t = pts.seconds
+                                if CutList.cut(containing: t, in: cuts) != nil { return true }     // frame is cut out
+                                let removed = CutList.removed(before: t, cuts: cuts)
+                                time = CMTimeSubtract(time, CMTime(value: CMTimeValue((removed * format.sampleRate).rounded()),
+                                                                   timescale: rate))
+                            }
+                            if time < .zero {
+                                // The frame showing at the trim point starts a hair earlier — pin it to zero.
+                                if state.videoAppended { return true }
+                                time = .zero
+                            }
+                            if time >= contentDuration { state.contentDone = true; return true }
+                            if !adaptor.append(pixels, withPresentationTime: time) {
+                                self.fail(Self.describe(writer.error, stage: "encoding the video"))
+                                finishVideo(); return false
+                            }
+                            state.videoAppended = true
+                            state.videoFrames += 1
+                            if state.videoFrames % 15 == 0 {
+                                state.videoProgress = min(1, time.seconds / totalSeconds)
+                                report()
+                            }
+                            return true
                         }
-                        guard let sample = videoOut.copyNextSampleBuffer() else { state.contentDone = true; continue }
-                        guard let pixels = CMSampleBufferGetImageBuffer(sample) else { continue }
-                        // Shift onto the new timeline that starts at zero, closing up any cuts.
-                        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                        var time = CMTimeSubtract(pts, startTime)
-                        if !cuts.isEmpty {
-                            let t = pts.seconds
-                            if CutList.cut(containing: t, in: cuts) != nil { continue }     // frame is cut out
-                            let removed = CutList.removed(before: t, cuts: cuts)
-                            time = CMTimeSubtract(time, CMTime(value: CMTimeValue((removed * format.sampleRate).rounded()),
-                                                               timescale: rate))
-                        }
-                        if time < .zero {
-                            // The frame showing at the trim point starts a hair earlier — pin it to zero.
-                            if state.videoAppended { continue }
-                            time = .zero
-                        }
-                        if time >= contentDuration { state.contentDone = true; continue }
-                        if !adaptor.append(pixels, withPresentationTime: time) {
-                            self.fail(Self.describe(writer.error, stage: "encoding the video"))
-                            finishVideo(); return
-                        }
-                        state.videoAppended = true
-                        state.videoFrames += 1
-                        if state.videoFrames % 15 == 0 {
-                            state.videoProgress = min(1, time.seconds / totalSeconds)
-                            report()
-                        }
+                        if !carryOn { return }
                     }
                 }
             }
@@ -333,23 +339,25 @@ final class VideoExporter {
                     // Keep a little decoded audio queued ahead of the renderer.
                     if audioSource == nil { state.sourceEnded = true }
                     while let audioOut = audioSource?.output, !state.sourceEnded && state.scheduled < state.renderedRaw + AVAudioFramePosition(self.chunk) * 4 {
-                        if let sample = audioOut.copyNextSampleBuffer() {
-                            if var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) {
-                                let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                                if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
-                                if let fadeEnd = self.source.fadeEnd {
-                                    AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd)
+                        autoreleasepool {       // one pool per decoded buffer: the export is one long loop
+                            if let sample = audioOut.copyNextSampleBuffer() {
+                                if var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) {
+                                    let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                                    if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
+                                    if let fadeEnd = self.source.fadeEnd {
+                                        AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd)
+                                    }
+                                    if !cuts.isEmpty {
+                                        // Drop the cut-out audio, with tiny fades so the joins don't click.
+                                        guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { return }
+                                        pcm = kept
+                                    }
+                                    self.rack.scheduleForExport(pcm)
+                                    state.scheduled += AVAudioFramePosition(pcm.frameLength)
                                 }
-                                if !cuts.isEmpty {
-                                    // Drop the cut-out audio, with tiny fades so the joins don't click.
-                                    guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { continue }
-                                    pcm = kept
-                                }
-                                self.rack.scheduleForExport(pcm)
-                                state.scheduled += AVAudioFramePosition(pcm.frameLength)
+                            } else {
+                                state.sourceEnded = true
                             }
-                        } else {
-                            state.sourceEnded = true
                         }
                     }
 

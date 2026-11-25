@@ -248,17 +248,19 @@ enum LoudnessScan {
             if isCancelled() { throw ScanError.cancelled }
             // Keep a little decoded audio queued ahead of the renderer.
             while !sourceEnded && scheduled < rendered + AVAudioFramePosition(chunk) * 4 {
-                guard let sample = output.copyNextSampleBuffer() else { sourceEnded = true; break }
-                guard var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) else { continue }
-                let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
-                if let fadeEnd { AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd) }
-                if !normalized.isEmpty {
-                    guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { continue }
-                    pcm = kept
+                autoreleasepool {       // the whole scan is one long loop: don't let buffers pile up
+                    guard let sample = output.copyNextSampleBuffer() else { sourceEnded = true; return }
+                    guard var pcm = AudioFeeder.pcmBuffer(from: sample, format: format) else { return }
+                    let t0 = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                    if !volume.isFlat { volume.apply(to: pcm, startingAt: t0) }
+                    if let fadeEnd { AudioFeeder.applyFadeOut(to: pcm, startingAt: t0, fadeEnd: fadeEnd) }
+                    if !normalized.isEmpty {
+                        guard let kept = AudioFeeder.keepOnly(pcm, startingAt: t0, segments: segments) else { return }
+                        pcm = kept
+                    }
+                    rack.scheduleForExport(pcm)
+                    scheduled += AVAudioFramePosition(pcm.frameLength)
                 }
-                rack.scheduleForExport(pcm)
-                scheduled += AVAudioFramePosition(pcm.frameLength)
             }
             let remaining = total + latency - rendered
             if remaining <= 0 { break }
