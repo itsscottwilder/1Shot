@@ -136,12 +136,24 @@ final class BrollRenderer {
     private var generators: [URL: AVAssetImageGenerator] = [:]
     private var readers: [URL: BrollReader] = [:]   // 3.5.2: in-order playback (see BrollReader)
     private var photos: [URL: CIImage] = [:]
+    private var durations: [URL: Double] = [:]      // each video's length, looked up once
+    private var recent: [URL] = []                  // videos by last use, oldest first
+    /// Each reader and generator holds its own decoders: keep only this many videos open.
+    private static let openLimit = 6
+    /// The last one-off (paused) frame: asked for again on every redraw while paused.
+    private var lastStill: (url: URL, time: Double, size: CGSize, image: CIImage)?
 
     func update(shots: [Shot], cuts: [Cut]) {
         lock.lock()
         _shots = shots; _cuts = cuts
         let inUse = Set(shots.map(\.url))
-        readers = readers.filter { inUse.contains($0.key) }   // let go of clips no longer on the timeline
+        // Let go of clips no longer on the timeline.
+        readers = readers.filter { inUse.contains($0.key) }
+        generators = generators.filter { inUse.contains($0.key) }
+        photos = photos.filter { inUse.contains($0.key) }
+        durations = durations.filter { inUse.contains($0.key) }
+        recent.removeAll { !inUse.contains($0) }
+        if let still = lastStill, !inUse.contains(still.url) { lastStill = nil }
         lock.unlock()
     }
 
@@ -243,15 +255,36 @@ final class BrollRenderer {
             gen.maximumSize = CGSize(width: extent.width * 1.2, height: extent.height * 1.2)
             generators[url] = gen
         }
+        // Most recently used last; past the limit, close the videos used longest ago.
+        recent.removeAll { $0 == url }
+        recent.append(url)
+        while recent.count > Self.openLimit {
+            let old = recent.removeFirst()
+            readers[old] = nil
+            generators[old] = nil
+        }
+        let known = durations[url]
         lock.unlock()
-        let duration = gen.asset.duration.seconds
-        let t = duration.isFinite && duration > 0.1 ? min(seconds, duration - 0.05) : seconds
+        // The length, once per video (asking the asset every frame blocks until it's loaded).
+        let duration: Double
+        if let known { duration = known } else {
+            duration = gen.asset.duration.seconds
+            lock.lock(); durations[url] = duration; lock.unlock()
+        }
+        let t = max(0, duration.isFinite && duration > 0.1 ? min(seconds, duration - 0.05) : seconds)
         // Playing or exporting: the next frame from a reader already rolling through the clip.
         // Anything else (a paused frame, scrubbing, a jump): one picture from the generator.
-        if let img = reader.frame(at: max(0, t)) { return img }
-        guard let cg = try? gen.copyCGImage(at: CMTime(seconds: max(0, t), preferredTimescale: 600), actualTime: nil)
+        if let img = reader.frame(at: t) { return img }
+        lock.lock()
+        if let still = lastStill, still.url == url, still.size == maxSize, abs(still.time - t) < 0.0005 {
+            lock.unlock(); return still.image                 // same paused frame as last redraw
+        }
+        lock.unlock()
+        guard let cg = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil)
         else { return nil }
-        return CIImage(cgImage: cg)
+        let img = CIImage(cgImage: cg)
+        lock.lock(); lastStill = (url, t, maxSize, img); lock.unlock()
+        return img
     }
 }
 
