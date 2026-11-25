@@ -131,7 +131,6 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var visualGroups: [VisualGroup] = VisualGroup.defaults
     var activeVisualGroup = VisualGroup.arollID
     var selectedVisualClip: VisualClip?
-    var visualLUTCache: [String: CubeLUT] = [:]
     var resumeAfterScrub = false
     lazy var graphicsPanel = TimelineListPanel(title: "Graphics", subtitle: "Plates in timeline order. Drag a plate on the timeline to move it in time; select one to resize or move it on screen.", thumbnails: true, accessory: plateControls)
     var zoomRowMap: [(punch: Int, reset: Int?)] = []
@@ -2470,7 +2469,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         do {
-            set(try CubeLUT(url: url))
+            set(try CubeLUT.cached(url: url))
             NSLog("1Shot: \(slot == .camera ? "camera" : "creative") LUT \(url.lastPathComponent) applied")
         } catch {
             set(nil)
