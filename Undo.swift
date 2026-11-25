@@ -61,8 +61,17 @@ struct EditState: Equatable {
     }
 }
 
+/// Lets the history close a waiting edit into its own step just before Undo / Redo runs.
+final class HistoryUndoManager: UndoManager {
+    var beforeUndoOrRedo: (() -> Void)?
+    var hasPending: (() -> Bool)?
+    override func undo() { beforeUndoOrRedo?(); super.undo() }
+    override func redo() { beforeUndoOrRedo?(); super.redo() }
+    override var canUndo: Bool { super.canUndo || (hasPending?() ?? false) }
+}
+
 final class EditHistory {
-    let undoManager = UndoManager()
+    let undoManager = HistoryUndoManager()
     private weak var controller: PlayerWindowController?
     private var timer: Timer?
     private var settled: EditState?        // the state the last undo step leads back from
@@ -71,25 +80,43 @@ final class EditHistory {
     private var identity: [URL?] = []      // project + video; a new one starts the history over
     private var aroll: ObjectIdentifier?   // the assembled A-roll; rebuilding it starts the history over too
     private var restoring = false
+    private var mouseMonitor: Any?
 
     init() {
         undoManager.levelsOfUndo = 200
+        // ⌘Z right after an edit, before its quiet half second: make it a step first, or Undo
+        // would skip it and put back the picture from before it AND the edit before it.
+        undoManager.beforeUndoOrRedo = { [weak self] in self?.commitPending() }
+        undoManager.hasPending = { [weak self] in self?.pendingState() != nil }
     }
 
     func attach(to controller: PlayerWindowController) {
         timer?.invalidate()
         self.controller = controller
         timer = Timer.everyMode(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.tick() }
+        // A new click starts a new step: close any edit still waiting for its quiet half second, so
+        // two quick timeline drags (which apply on mouse-up) don't merge into one undo.
+        if mouseMonitor == nil {
+            mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+                self?.commitPending()
+                return event
+            }
+        }
     }
 
     /// Stops watching for edits (the window is closing).
     func detach() {
         timer?.invalidate()
         timer = nil
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        mouseMonitor = nil
         controller = nil
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        timer?.invalidate()
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+    }
 
     private func tick() {
         guard let c = controller, !restoring, let now = c.editState() else { return }
@@ -111,7 +138,29 @@ final class EditHistory {
         }
         // Changed, and has held still for a moment with the mouse up: that's one step.
         guard ProcessInfo.processInfo.systemUptime - changedAt >= 0.45,
-              NSEvent.pressedMouseButtons == 0, let old = settled else { return }
+              NSEvent.pressedMouseButtons == 0 else { return }
+        record(now)
+    }
+
+    /// Makes an edit that hasn't become a step yet into one now (a new click is starting).
+    private func commitPending() {
+        guard let now = pendingState() else { return }
+        seen = now
+        record(now)
+    }
+
+    /// The edit that hasn't become a step yet, if there is one.
+    private func pendingState() -> EditState? {
+        guard let c = controller, !restoring, settled != nil, let now = c.editState(), now != settled else { return nil }
+        // Another project or video just opened: tick() starts the history over, not a step.
+        let id: [URL?] = [c.project?.fileURL.standardizedFileURL, c.currentVideo?.standardizedFileURL]
+        let built = c.currentVideo == nil ? c.sourceAsset.map(ObjectIdentifier.init) : nil
+        guard id == identity, built == aroll else { return nil }
+        return now
+    }
+
+    private func record(_ now: EditState) {
+        guard let old = settled else { return }
         settled = now
         let name = Self.describe(from: old, to: now)
         undoManager.registerUndo(withTarget: self) { history in

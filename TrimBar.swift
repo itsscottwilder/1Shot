@@ -213,13 +213,14 @@ final class TrimBar: NSView {
 
     // MARK: V2 — B-roll track (above the clips)
 
-    struct BrollBlock { var start: Double; var end: Double; var label: String; var photo: Bool; var pending: Bool }
+    struct BrollBlock: Equatable { var start: Double; var end: Double; var label: String; var photo: Bool; var pending: Bool }
     /// B-roll shots on V2 (clip times), set by the window.
-    var brollBlocks: [BrollBlock] = [] { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    // Redraw only on a real change: framing and graphics sliders re-send identical blocks on every tick.
+    var brollBlocks: [BrollBlock] = [] { didSet { guard brollBlocks != oldValue else { return }; needsDisplay = true; window?.invalidateCursorRects(for: self) } }
 
     /// Motion graphics plates, shown as pink boxes on the V2 lane (under B-roll where they overlap).
-    struct GraphicsBlock { var start: Double; var end: Double; var label: String; var fullScreen: Bool }
-    var graphicsBlocks: [GraphicsBlock] = [] { didSet { needsDisplay = true } }
+    struct GraphicsBlock: Equatable { var start: Double; var end: Double; var label: String; var fullScreen: Bool }
+    var graphicsBlocks: [GraphicsBlock] = [] { didSet { if graphicsBlocks != oldValue { needsDisplay = true } } }
     // Visual Design selection (3.2): the clip picked on the timeline turns its group's colour.
     enum ClipPick { case aroll(Double), broll(Int) }
     enum ClipHighlight { case v1(start: Double, end: Double), broll(Int) }

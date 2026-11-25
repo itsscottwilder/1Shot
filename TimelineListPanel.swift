@@ -95,6 +95,18 @@ final class TimelineListPanel: NSVisualEffectView, NSTableViewDataSource, NSTabl
 
     /// Replaces the list (keeps the selection when the row count is unchanged).
     func setRows(_ newRows: [TimelineListRow], summary: String) {
+        if newRows.count == rows.count, !rows.isEmpty {
+            // Same rows, new contents (e.g. every tick of a slider drag): refill the row views
+            // that are on screen instead of reloading the table, which rebuilt and flickered.
+            rows = newRows
+            summaryLabel.stringValue = summary
+            let visible = table.rows(in: table.visibleRect)
+            for r in visible.location..<(visible.location + visible.length) where rows.indices.contains(r) {
+                (table.view(atColumn: 0, row: r, makeIfNecessary: false) as? TimelineRowView)?.configure(rows[r], number: r + 1)
+            }
+            onSelectionChanged?(selectedRow)
+            return
+        }
         let keep = newRows.count == rows.count ? selectedRow : nil
         rows = newRows
         summaryLabel.stringValue = summary

@@ -468,6 +468,8 @@ extension PlayerWindowController {
                                    color: TrimBar.graphicsColor, thumbnail: graphicsThumb(p))
         }
         graphicsPanel.setRows(rows, summary: "\(graphics.count) plate\(graphics.count == 1 ? "" : "s")")
+        let live = Set(graphics.map(\.id))
+        if plateThumbCache.count > live.count { plateThumbCache = plateThumbCache.filter { live.contains($0.key) } }
     }
 
     // MARK: Thumbnails
@@ -496,10 +498,11 @@ extension PlayerWindowController {
         }
     }
 
-    /// The plate itself, drawn small on a dark frame (cached by its content).
+    /// The plate itself, drawn small on a dark frame. One cached image per plate id, redrawn only
+    /// when the plate or the graphics style changes (keying by the whole plate kept every slider tick).
     private func graphicsThumb(_ p: GraphicPlate) -> NSImage? {
-        let key = "plate:" + ((try? JSONEncoder().encode(p)).map { String(decoding: $0, as: UTF8.self) } ?? p.id)
-        if let hit = listThumbCache[key] { return hit }
+        let style = "\(GraphicsStyle.redHex)|\(GraphicsTuningStore.version)"
+        if let hit = plateThumbCache[p.id], hit.plate == p, hit.style == style { return hit.image }
         let w = 192, h = 108
         guard let plate = PlateDrawing.render(p, width: w, height: h, red: GraphicsStyle.red) else { return nil }
         let img = NSImage(size: NSSize(width: w, height: h))
@@ -508,7 +511,7 @@ extension PlayerWindowController {
         NSRect(x: 0, y: 0, width: w, height: h).fill()
         NSGraphicsContext.current?.cgContext.draw(plate, in: CGRect(x: 0, y: 0, width: w, height: h))
         img.unlockFocus()
-        listThumbCache[key] = img
+        plateThumbCache[p.id] = (p, style, img)
         return img
     }
 }
