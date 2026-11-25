@@ -136,6 +136,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     lazy var graphicsPanel = TimelineListPanel(title: "Graphics", subtitle: "Plates in timeline order. Drag a plate on the timeline to move it in time; select one to resize or move it on screen.", thumbnails: true, accessory: plateControls)
     var zoomRowMap: [(punch: Int, reset: Int?)] = []
     var listThumbCache: [String: NSImage] = [:]
+    /// B-roll thumbnails being made now, so a refresh (every framing-slider tick) doesn't ask again.
+    var brollThumbsLoading = Set<String>()
     /// Graphics list thumbnails, one per plate id: a slider drag replaces its entry instead of adding one.
     var plateThumbCache: [String: (plate: GraphicPlate, style: String, image: NSImage)] = [:]
     private(set) var currentTab: WorkspaceTab = .visualDesign

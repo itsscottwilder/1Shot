@@ -476,26 +476,39 @@ extension PlayerWindowController {
 
     private func brollThumbKey(_ c: BrollClip) -> String { "\(c.file ?? c.id)@\(c.sourceIn ?? 0)" }
 
+    /// One request per shot: skipped while that shot's thumbnail is already on its way.
     private func makeBrollThumb(_ c: BrollClip, row: Int) {
         guard let url = brollURL(c) else { return }
         let key = brollThumbKey(c)
+        guard !brollThumbsLoading.contains(key) else { return }
+        brollThumbsLoading.insert(key)
+        let deliver: (CGImage?) -> Void = { [weak self] cg in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.brollThumbsLoading.remove(key)
+                guard let cg else { return }
+                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                self.listThumbCache[key] = img
+                if let r = self.broll.firstIndex(where: { self.brollThumbKey($0) == key }) { self.brollPanel.setThumbnail(img, row: r) }
+            }
+        }
         if c.isPhoto {
-            if let img = NSImage(contentsOf: url) { listThumbCache[key] = img; brollPanel.setThumbnail(img, row: row) }
+            // A small thumbnail straight from the file, off the main thread, instead of decoding the whole photo.
+            DispatchQueue.global(qos: .utility).async {
+                let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                kCGImageSourceCreateThumbnailWithTransform: true,
+                                                kCGImageSourceThumbnailMaxPixelSize: 384]
+                let cg = CGImageSourceCreateWithURL(url as CFURL, nil)
+                    .flatMap { CGImageSourceCreateThumbnailAtIndex($0, 0, options as CFDictionary) }
+                deliver(cg)
+            }
             return
         }
         let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         gen.appliesPreferredTrackTransform = true
         gen.maximumSize = CGSize(width: 192, height: 108)
         let t = CMTime(seconds: (c.sourceIn ?? 0) + 0.5, preferredTimescale: 600)
-        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: t)]) { [weak self] _, cg, _, _, _ in
-            guard let cg else { return }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                self.listThumbCache[key] = img
-                if let r = self.broll.firstIndex(where: { self.brollThumbKey($0) == key }) { self.brollPanel.setThumbnail(img, row: r) }
-            }
-        }
+        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: t)]) { _, cg, _, _, _ in deliver(cg) }
     }
 
     /// The plate itself, drawn small on a dark frame. One cached image per plate id, redrawn only
