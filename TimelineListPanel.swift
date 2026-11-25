@@ -31,6 +31,7 @@ final class TimelineListPanel: NSVisualEffectView, NSTableViewDataSource, NSTabl
     private var suppressSelect = false
 
     var selectedRow: Int? { table.selectedRow >= 0 ? table.selectedRow : nil }
+    var rowCount: Int { rows.count }
 
     init(title: String, subtitle: String, inLabel: String = "In", outLabel: String = "Out",
          thumbnails: Bool, accessory: NSView? = nil) {

@@ -119,7 +119,14 @@ extension PlayerWindowController {
             let box = map(brollBox(c))
             if brollHandles.box != box { brollHandles.box = box }
         }
-        if brollPanel.selectedRow != i { brollPanel.select(i) }
+        // Select its row, but only a row the list has: right after an Undo the clips are back
+        // before the list is refreshed, and asking for a missing row deselects, which calls here
+        // again (it looped until the stack ran out). The flag stops any other way back in.
+        if brollPanel.selectedRow != i, i < brollPanel.rowCount, !selectingBrollRow {
+            selectingBrollRow = true
+            brollPanel.select(i)
+            selectingBrollRow = false
+        }
     }
 
     private func beginBrollDrag(_ grab: PlateHandlesView.Grab, at point: NSPoint) {

@@ -124,6 +124,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var plateDrag: PlateDrag?
     let brollHandles = PlateHandlesView()               // 3.2: picture-in-picture B-roll on the video
     var brollDrag: BrollDrag?
+    var selectingBrollRow = false      // updateBrollHandles is selecting a row (stops it looping)
     let exportPanel = ExportPanel()
     var scrubInProgress = false
     // Visual Design groups (3.2; see VisualGroupControl.swift)
@@ -3133,6 +3134,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
         viewerWatchdog?.cancel(); viewerWatchdog = nil
+        history.detach()
+        drawer.stopMeters()
         player?.pause()
         rack.detach()
         playerView.player = nil

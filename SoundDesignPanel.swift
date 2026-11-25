@@ -10,6 +10,7 @@ final class SoundDesignPanel: NSVisualEffectView {
     private let rack: AudioRack
     private let meter = MeterView()
     private var meterTimer: Timer?
+    private var metersIdle = true      // off screen last tick; the next tick drops stale peaks
     private let isolationAmount = ResetSlider()
     private let isolationModel = NSSlider()
     private let isolationAmountLabel = NSTextField(labelWithString: "Off")
@@ -284,7 +285,23 @@ final class SoundDesignPanel: NSVisualEffectView {
         addSubview(scroll)
 
         meterTimer = Timer.everyMode(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            guard let self, !self.isHidden else { return }
+            guard let self else { return }
+            // Only meter when someone can see it. A closed last window is hidden for reuse,
+            // not torn down, so without the window check this polled 30 times a second forever.
+            guard !self.isHidden, let window = self.window, window.isVisible,
+                  window.occlusionState.contains(.visible) else {
+                self.metersIdle = true
+                return
+            }
+            if self.metersIdle {
+                // Back on screen: throw away the peaks held while nobody was looking,
+                // so an old reduction doesn't flash on the first frame.
+                self.metersIdle = false
+                _ = self.rack.compressorGainReduction()
+                _ = self.rack.deEsserGainReduction()
+                _ = self.rack.gateGainReduction()
+                _ = self.rack.limiterGainReduction()
+            }
             let reading = self.rack.meterReading()
             self.meter.update(peak: reading.peak, rms: reading.rms)
             self.gainReduction.update(reduction: self.rack.compressorGainReduction())
@@ -305,6 +322,14 @@ final class SoundDesignPanel: NSVisualEffectView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Stops the meter timer for good (the window is closing).
+    func stopMeters() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+    }
+
+    deinit { meterTimer?.invalidate() }
 
     // MARK: Click a section title to bypass it
 

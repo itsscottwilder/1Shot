@@ -385,6 +385,10 @@ final class AudioRack {
             }
     }
 
+    deinit {
+        if let engineToken { NotificationCenter.default.removeObserver(engineToken) }
+    }
+
     // MARK: Connecting to a video (main thread)
 
     func attach(to player: AVPlayer, item: AVPlayerItem, asset: AVAsset,
