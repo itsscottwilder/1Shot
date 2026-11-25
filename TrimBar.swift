@@ -20,7 +20,10 @@ final class TrimBar: NSView {
     var playhead: Double = 0 {
         didSet {
             guard abs(playhead - oldValue) > 0.001 else { return }
-            needsDisplay = true
+            // The line is its own layer: moving it doesn't redraw the filmstrip and waveform.
+            // Only a cut being marked (X) is drawn from the playhead, so that still redraws.
+            if pendingCutStart != nil { needsDisplay = true }
+            placePlayhead()
             followPlayhead()
         }
     }
@@ -43,6 +46,9 @@ final class TrimBar: NSView {
     private var showsClips: Bool { clipView && !showFullAsset }
     private var layoutFrozen = false            // while an edge is dragged, the clips don't reflow
     private var segs: [(s: Double, e: Double)] = []
+    private var segAcc: [Double] = []          // shown time where each kept segment starts
+    private let playheadLine = PassThroughLine()
+    private let overviewTick = PassThroughLine()
     private var shownLength: Double = 0.001
     private var dragOriginX: CGFloat = 0
     private var dragOriginValue: Double = 0
@@ -55,7 +61,9 @@ final class TrimBar: NSView {
         } else {
             segs = [(s: 0, e: duration)]
         }
-        shownLength = max(0.001, segs.reduce(0) { $0 + ($1.e - $1.s) })
+        var acc = 0.0
+        segAcc = segs.map { g in defer { acc += g.e - g.s }; return acc }
+        shownLength = max(0.001, acc)
         clampView()
         syncZoomSlider()
         needsDisplay = true
@@ -65,29 +73,29 @@ final class TrimBar: NSView {
     /// Clip time → place on the shown timeline (seconds). Times inside a cut land on its edit point;
     /// times before/after the kept parts extend past the ends (so a dragged trim handle can follow).
     private func shown(_ t: Double) -> Double {
-        guard let first = segs.first, let last = segs.last else { return t }
+        guard let first = segs.first, let last = segs.last, segAcc.count == segs.count else { return t }
         if t <= first.s { return t - first.s }
-        var acc = 0.0
-        for g in segs {
-            if t <= g.e { return acc + max(0, t - g.s) }
-            acc += g.e - g.s
-        }
-        return acc + (t - last.e)
+        // First kept segment that ends at or after t (binary search; there can be hundreds).
+        var lo = 0, hi = segs.count
+        while lo < hi { let m = (lo + hi) / 2; if segs[m].e < t { lo = m + 1 } else { hi = m } }
+        if lo < segs.count { return segAcc[lo] + max(0, t - segs[lo].s) }
+        return segAcc[segs.count - 1] + (last.e - last.s) + (t - last.e)
     }
 
     /// Place on the shown timeline → clip time.
     private func clipTime(shown d: Double) -> Double {
-        guard let first = segs.first, let last = segs.last else { return d }
+        guard let first = segs.first, let last = segs.last, segAcc.count == segs.count else { return d }
         if d <= 0 { return first.s + d }
-        var acc = 0.0
-        for g in segs {
-            let len = g.e - g.s
-            if d <= acc + len { return g.s + (d - acc) }
-            acc += len
+        // First segment whose shown end is at or after d.
+        var lo = 0, hi = segs.count
+        while lo < hi {
+            let m = (lo + hi) / 2
+            if segAcc[m] + (segs[m].e - segs[m].s) < d { lo = m + 1 } else { hi = m }
         }
-        return last.e + (d - acc)
+        if lo < segs.count { return segs[lo].s + (d - segAcc[lo]) }
+        return last.e + (d - (segAcc[segs.count - 1] + (last.e - last.s)))
     }
-    var pendingCutStart: Double? { didSet { needsDisplay = true } }
+    var pendingCutStart: Double? { didSet { needsDisplay = true; placePlayhead() } }
     /// A cut was clicked (nil = clicked outside any cut).
     var onSelectCut: ((Int?) -> Void)?
     /// "Remove Cut" chosen from a cut's right-click menu.
@@ -330,12 +338,6 @@ final class TrimBar: NSView {
             NSGraphicsContext.restoreGraphicsState()
         }
         NSGraphicsContext.restoreGraphicsState()
-        // The playhead runs through V2 too, down to the clips.
-        let px = x(for: playhead)
-        if px >= stripRect.minX - 1 && px <= stripRect.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: px - 1, y: lane.minY, width: 2, height: stripRect.minY - lane.minY).fill()
-        }
     }
 
     @objc private func removeBrollChosen(_ sender: NSMenuItem) { onRemoveBroll?(sender.tag) }
@@ -436,6 +438,8 @@ final class TrimBar: NSView {
         addSubview(zoomOutButton)
         addSubview(zoomSlider)
         addSubview(zoomInButton)
+        addSubview(playheadLine)
+        addSubview(overviewTick)
     }
 
     private var isDragging: Bool {
@@ -654,6 +658,34 @@ final class TrimBar: NSView {
         NSRect(x: x(for: end), y: stripRect.minY - 3, width: handleWidth, height: stripRect.height + 6)
     }
 
+    // MARK: Playhead (layer views over everything, so moving it redraws nothing)
+
+    /// Puts the playhead line (V2 through A1) and the overview tick where the playhead is.
+    private func placePlayhead() {
+        guard duration > 0 else { playheadLine.isHidden = true; overviewTick.isHidden = true; return }
+        let strip = stripRect
+        let px = x(for: playhead)
+        let onStrip = px >= strip.minX - 1 && px <= strip.maxX + 1
+        playheadLine.isHidden = !onStrip
+        if onStrip {
+            let top = laneRect.minY, bottom = audioLaneRect.maxY
+            let f = NSRect(x: px - 1, y: top, width: 2, height: bottom - top)
+            if playheadLine.frame != f { playheadLine.frame = f }
+        }
+        overviewTick.isHidden = zoom <= 1.0001
+        if !overviewTick.isHidden {
+            let o = overviewRect
+            let ox = o.minX + CGFloat(shown(playhead) / shownLength) * o.width
+            let f = NSRect(x: ox - 0.5, y: o.minY - 1, width: 1, height: o.height + 2)
+            if overviewTick.frame != f { overviewTick.frame = f }
+        }
+    }
+
+    override func viewWillDraw() {
+        super.viewWillDraw()
+        placePlayhead()            // zoom, scroll, resize and new layouts all come through a redraw
+    }
+
     // MARK: Drawing
 
     override func draw(_ dirtyRect: NSRect) {
@@ -840,12 +872,6 @@ final class TrimBar: NSView {
             yellow.setFill()
         }
 
-        // Playhead
-        let px = x(for: playhead)
-        if px >= strip.minX - 1 && px <= strip.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: px - 1, y: strip.minY - 6, width: 2, height: strip.height + 12).fill()
-        }
         NSGraphicsContext.restoreGraphicsState()
 
         // Overview bar (only when zoomed in)
@@ -863,8 +889,6 @@ final class TrimBar: NSView {
             NSBezierPath(roundedRect: thumb, xRadius: 2, yRadius: 2).fill()
             NSColor.white.withAlphaComponent(0.8).setStroke()
             NSBezierPath(roundedRect: thumb, xRadius: 2, yRadius: 2).stroke()
-            NSColor.white.setFill()
-            NSRect(x: ox(playhead) - 0.5, y: o.minY - 1, width: 1, height: o.height + 2).fill()
         }
 
         drawBrollLane()
@@ -972,12 +996,6 @@ final class TrimBar: NSView {
         }
         NSColor.white.withAlphaComponent(0.08).setFill()
         NSRect(x: lane.minX, y: midY, width: lane.width, height: 0.5).fill()
-        // The playhead runs through A1 too.
-        let x0 = x(for: playhead)
-        if x0 >= lane.minX - 1 && x0 <= lane.maxX + 1 {
-            NSColor.white.setFill()
-            NSRect(x: x0 - 1, y: lane.minY, width: 2, height: lane.height).fill()
-        }
         NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -1612,4 +1630,18 @@ final class TrimBar: NSView {
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
+}
+
+/// A plain white line on its own layer that lets every click through to the timeline under it.
+private final class PassThroughLine: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.white.cgColor
+        layer?.actions = ["position": NSNull(), "bounds": NSNull(), "frame": NSNull(), "hidden": NSNull()]
+        isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override var isOpaque: Bool { true }
 }
