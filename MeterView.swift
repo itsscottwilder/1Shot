@@ -21,6 +21,7 @@ final class MeterView: NSView {
         let now = ProcessInfo.processInfo.systemUptime
         let dt = Float(min(0.2, now - lastUpdate))
         lastUpdate = now
+        let before = (peakDB, holdDB, clipped)
         for c in 0..<2 {
             let p = toDB(c < peak.count ? peak[c] : 0)
             let r = toDB(c < rms.count ? rms[c] : 0)
@@ -37,7 +38,8 @@ final class MeterView: NSView {
             // True clipping = reaching 0 dBFS. (The limiter's −0.1 dB ceiling must NOT light this.)
             if c < peak.count, peak[c] >= 0.9999 { clipped[c] = true }
         }
-        needsDisplay = true
+        // Redraw only when something on screen moved (at rest, nothing does).
+        if before.0 != peakDB || before.1 != holdDB || before.2 != clipped { needsDisplay = true }
     }
 
     private func toDB(_ linear: Float) -> Float {
@@ -66,15 +68,25 @@ final class MeterView: NSView {
 
     // MARK: Drawing
 
+    // The labels never change, so they are built once (not on every redraw).
+    private static let channelLabels: [NSAttributedString] = ["L", "R"].map {
+        NSAttributedString(string: $0, attributes: [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor])
+    }
+    private static let scaleLabels: [(db: Float, text: NSAttributedString, width: CGFloat)] =
+        ([-48, -36, -24, -18, -12, -6, -3, 0] as [Float]).map { db in
+            let text = NSAttributedString(string: "\(Int(db))", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor])
+            return (db, text, text.size().width)
+        }
+
     override func draw(_ dirtyRect: NSRect) {
         let green = NSColor.systemGreen, yellow = NSColor.systemYellow, red = NSColor.systemRed
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor]
 
         for c in 0..<2 {
             let bar = barRect(c)
-            NSAttributedString(string: c == 0 ? "L" : "R", attributes: labelAttrs)
-                .draw(at: NSPoint(x: 1, y: bar.minY - 1))
+            Self.channelLabels[c].draw(at: NSPoint(x: 1, y: bar.minY - 1))
 
             NSColor(white: 0.1, alpha: 1).setFill()
             NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
@@ -102,16 +114,12 @@ final class MeterView: NSView {
         }
 
         // dB scale
-        let scaleAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor]
         let bar = barRect(1)
-        for db: Float in [-48, -36, -24, -18, -12, -6, -3, 0] {
-            let px = x(forDB: db, in: bar)
+        for label in Self.scaleLabels {
+            let px = x(forDB: label.db, in: bar)
             NSColor(white: 1, alpha: 0.25).setFill()
             NSRect(x: px - 0.5, y: bar.maxY + 2, width: 1, height: 3).fill()
-            let text = NSAttributedString(string: "\(Int(db))", attributes: scaleAttrs)
-            text.draw(at: NSPoint(x: px - text.size().width / 2, y: bar.maxY + 5))
+            label.text.draw(at: NSPoint(x: px - label.width / 2, y: bar.maxY + 5))
         }
     }
 
