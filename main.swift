@@ -124,6 +124,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var plateDrag: PlateDrag?
     let brollHandles = PlateHandlesView()               // 3.2: picture-in-picture B-roll on the video
     var brollDrag: BrollDrag?
+    private var transcriptCache: (url: URL, modified: Date, size: Int, transcript: EditTranscript)?
     var selectingBrollRow = false      // updateBrollHandles is selecting a row (stops it looping)
     let exportPanel = ExportPanel()
     var scrubInProgress = false
@@ -2935,8 +2936,20 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     func currentTranscript() -> (transcript: EditTranscript, url: URL)? {
         guard let project, let rel = project.data.transcript else { return nil }
         let url = project.folder.appendingPathComponent(rel)
-        guard let data = try? Data(contentsOf: url),
-              let t = try? JSONDecoder().decode(EditTranscript.self, from: data) else { return nil }
+        // This is asked for often (every status check from Claude asks twice), and a long
+        // recording's transcript is every word with its timing: decode it once per file change.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let modified = attrs?[.modificationDate] as? Date
+        let size = (attrs?[.size] as? NSNumber)?.intValue
+        let t: EditTranscript
+        if let hit = transcriptCache, hit.url == url, hit.modified == modified, hit.size == size {
+            t = hit.transcript
+        } else {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(EditTranscript.self, from: data) else { return nil }
+            t = decoded
+            if let modified, let size { transcriptCache = (url, modified, size, decoded) }
+        }
         if currentVideo == nil {
             guard sourceAsset != nil, let recipe = arollRecipe, t.source == recipe else { return nil }
         } else if t.source != nil {

@@ -9,7 +9,7 @@
 
 import Cocoa
 
-struct ProjectData: Codable {
+struct ProjectData: Codable, Equatable {
     var version = 1
     var video: String?              // path inside the project folder, e.g. "Media/IMG_0022.mov"
     var trimStart: Double?
@@ -46,6 +46,7 @@ final class Project {
     let fileURL: URL
     var data: ProjectData
     private var lastSaved: Data?
+    private var lastSavedData: ProjectData?     // what `lastSaved` was encoded from
 
     var name: String { fileURL.deletingPathExtension().lastPathComponent }
     var mediaFolder: URL { folder.appendingPathComponent("Media", isDirectory: true) }
@@ -161,12 +162,15 @@ final class Project {
 
     /// Writes the settings file if anything changed.
     func save() throws {
+        // Called every 1.5 s: when nothing changed, comparing is far cheaper than encoding it all.
+        if lastSaved != nil, lastSavedData == data { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let raw = try encoder.encode(data)
-        guard raw != lastSaved else { return }
+        guard raw != lastSaved else { lastSavedData = data; return }
         try raw.write(to: fileURL, options: .atomic)
         lastSaved = raw
+        lastSavedData = data
     }
 
     // MARK: Assets
